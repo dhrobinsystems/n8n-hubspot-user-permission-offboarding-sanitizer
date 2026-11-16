@@ -45,6 +45,8 @@ This workflow runs daily, or on demand from an HRIS or IT ticket webhook. It fin
 
 ## 2. Architecture
 
+![n8n HubSpot User Permission Offboarding Sanitizer Workflow Overview](./workflow-overview.png)
+
 ```mermaid
 flowchart TD
     T1["Daily Offboarding Scan<br/>schedule · pinned fixtures"] --> A

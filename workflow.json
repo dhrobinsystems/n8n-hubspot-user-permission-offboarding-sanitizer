@@ -1,0 +1,2675 @@
+{
+  "name": "n8n-hubspot-user-permission-offboarding-sanitizer",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 6,
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "id": "698dcb54-0181-57fc-be79-70fbb3927444",
+      "name": "Daily Offboarding Scan",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        200
+      ],
+      "notes": "Daily scan for recently deactivated, suspended or unassigned users. Pinned fictional fixtures included."
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hubspot-offboarding-sanitizer",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "b35bd129-d7e8-56af-b8f4-8d1a7254addb",
+      "name": "Offboarding Request Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        400
+      ],
+      "webhookId": "00000000-0000-4000-8000-0000000000b2",
+      "notes": "HRIS / IT ticket hook: { users: [{ email | userId | ownerId }], requestId, effectiveDate }. Requires x-webhook-secret."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Run Context & Authenticate     Mode: Run Once for All Items\n// Repo: n8n-hubspot-user-permission-offboarding-sanitizer · dhRobin Systems\n// Works for both triggers. Scheduled runs scan recent deactivations; the\n// webhook accepts an explicit offboarding request (HRIS / IT ticket) and\n// must carry the shared secret. Fails closed.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nlet crypto = null;\ntry { crypto = require('crypto'); } catch (error) { crypto = null; }\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst SECRET_HEADER = env('WEBHOOK_SECRET_HEADER', 'x-webhook-secret').toLowerCase();\nconst SANDBOX_FIXTURE_SECRET = 'sandbox-fictional-secret-not-for-production';\nconst EXPECTED_SECRET = env('WEBHOOK_SHARED_SECRET', '') || (SANDBOX_MODE ? SANDBOX_FIXTURE_SECRET : '');\n\nconst safeEqual = (a, b) => {\n  if (typeof a !== 'string' || typeof b !== 'string' || !a || !b) return false;\n  if (crypto) {\n    return crypto.timingSafeEqual(crypto.createHash('sha256').update(a).digest(), crypto.createHash('sha256').update(b).digest());\n  }\n  let diff = a.length ^ b.length;\n  for (let i = 0; i < Math.max(a.length, b.length); i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);\n  return diff === 0;\n};\n\nlet runId;\ntry { runId = 'offb_' + crypto.randomUUID(); } catch (error) { runId = 'offb_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10); }\n\nconst input = $input.first() ? $input.first().json : {};\nconst isWebhook = input && typeof input.headers === 'object' && input.headers !== null;\n\nconst run = {\n  runId,\n  startedAt: new Date().toISOString(),\n  mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live',\n  sandboxMode: SANDBOX_MODE,\n  dryRun: DRY_RUN,\n  trigger: isWebhook ? 'webhook' : 'schedule',\n  hubspotApiBase: env('HUBSPOT_API_BASE_URL', 'https://api.hubapi.com'),\n  accepted: true,\n  rejectReason: null,\n  request: null,\n};\n\nconst normaliseRequest = (body) => {\n  const users = Array.isArray(body && body.users) ? body.users.slice(0, 50) : [];\n  return {\n    requestId: body && body.requestId ? String(body.requestId).slice(0, 80) : null,\n    effectiveDate: body && body.effectiveDate ? String(body.effectiveDate).slice(0, 40) : null,\n    requestedBy: body && body.requestedBy ? String(body.requestedBy).slice(0, 120) : null,\n    users: users\n      .map((u) => ({\n        email: u && u.email ? String(u.email).trim().toLowerCase() : null,\n        userId: u && u.userId != null ? String(u.userId) : null,\n        ownerId: u && u.ownerId != null ? String(u.ownerId) : null,\n      }))\n      .filter((u) => u.email || u.userId || u.ownerId),\n  };\n};\n\nif (isWebhook) {\n  const headers = {};\n  for (const [k, v] of Object.entries(input.headers || {})) headers[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);\n  if (!EXPECTED_SECRET) { run.accepted = false; run.rejectReason = 'shared_secret_not_configured'; }\n  else if (!safeEqual(headers[SECRET_HEADER] || '', EXPECTED_SECRET)) { run.accepted = false; run.rejectReason = 'shared_secret_mismatch'; }\n  else {\n    let body = input.body;\n    if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = null; } }\n    run.request = normaliseRequest(body);\n    if (!run.request.users.length) { run.accepted = false; run.rejectReason = 'no_users_in_request'; }\n  }\n} else {\n  // Scheduled run: optional standing list of people being offboarded.\n  const emails = csv('OFFBOARDING_USER_EMAILS').map((e) => e.toLowerCase());\n  const ids = csv('OFFBOARDING_USER_IDS');\n  const fixtureRequest = SANDBOX_MODE && input.sandboxFixtures ? input.sandboxFixtures.offboardingRequest : null;\n  run.request = fixtureRequest\n    ? normaliseRequest(fixtureRequest)\n    : { requestId: null, effectiveDate: null, requestedBy: 'scheduled_scan', users: [...emails.map((email) => ({ email })), ...ids.map((userId) => ({ userId }))] };\n}\n\nconst fixtures = SANDBOX_MODE && input && typeof input.sandboxFixtures === 'object' ? input.sandboxFixtures : null;\n\nreturn [{ json: { kind: run.accepted ? 'run' : 'rejected', run, sandboxFixtures: fixtures } }];\n"
+      },
+      "id": "d3a33191-ecd9-5c34-9eda-faccfc3d255d",
+      "name": "Build Run Context & Authenticate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e1dac954-d9db-5dac-b048-ac9936f91c99",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "run",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "13c398b8-dda0-5e72-a459-a83f8e854eb5",
+      "name": "Request Accepted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "6d90148d-2837-5d9e-9639-7d2c74829c4e",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "253726c7-a450-5690-8ea6-0973082867e8",
+      "name": "Sandbox Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Load Sandbox Directory               Mode: Run Once for All Items\n// Emits the fictional users/owners directory in the same shape that the\n// live \"Collect Directory\" node produces. Relative dates are resolved so\n// the fixtures never go stale.\n// ─────────────────────────────────────────────────────────────────────\nconst { run, sandboxFixtures } = $input.first().json;\n\nconst resolveDates = (value) => {\n  if (typeof value === 'string') {\n    let m = value.match(/^SANDBOX_DAYS_AGO:(\\d{1,4})$/);\n    if (m) return new Date(Date.now() - Number(m[1]) * 86400000).toISOString();\n    m = value.match(/^SANDBOX_DAYS_FROM_NOW:(\\d{1,4})$/);\n    if (m) return new Date(Date.now() + Number(m[1]) * 86400000).toISOString().slice(0, 10);\n    return value;\n  }\n  if (Array.isArray(value)) return value.map(resolveDates);\n  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, resolveDates(v)]));\n  return value;\n};\n\nif (!sandboxFixtures || !sandboxFixtures.directory) {\n  return [{ json: { kind: 'directory', run, directory: { ok: false, reason: 'sandbox_fixtures_missing', users: [], activeOwners: [], archivedOwners: [] } } }];\n}\n\nconst directory = resolveDates(sandboxFixtures.directory);\nreturn [{\n  json: {\n    kind: 'directory',\n    run,\n    directory: { ok: true, source: 'sandbox_fixtures', users: directory.users || [], activeOwners: directory.activeOwners || [], archivedOwners: directory.archivedOwners || [] },\n    sandboxEvidence: resolveDates(sandboxFixtures.evidence || {}),\n    sandboxPriorReports: sandboxFixtures.priorReports || [],\n  },\n}];\n"
+      },
+      "id": "56109406-4ebc-5964-bf62-9348b0573e45",
+      "name": "Load Sandbox Directory",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Build Run Context & Authenticate').first().json.run.hubspotApiBase }}/settings/v3/users",
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "after",
+                    "value": "={{ $response.body.paging?.next?.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging?.next?.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 50
+            }
+          },
+          "timeout": 15000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "100"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "9aa67984-8d9f-588c-9be5-a1ca2333e3fb",
+      "name": "List HubSpot Users",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        360
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "executeOnce": true,
+      "notes": "Active users (roles, teams). Scope: settings.users.read."
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Build Run Context & Authenticate').first().json.run.hubspotApiBase }}/crm/v3/owners",
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "after",
+                    "value": "={{ $response.body.paging?.next?.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging?.next?.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 20
+            }
+          },
+          "timeout": 15000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "archived",
+              "value": "true"
+            },
+            {
+              "name": "limit",
+              "value": "500"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "be3f0883-ebdf-5fd3-9345-5df85589ecba",
+      "name": "List Archived Owners",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        360
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "executeOnce": true,
+      "notes": "Deactivated users: userId is null, userIdIncludingInactive holds the user ID. Scope: crm.objects.owners.read."
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Build Run Context & Authenticate').first().json.run.hubspotApiBase }}/crm/v3/owners",
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "after",
+                    "value": "={{ $response.body.paging?.next?.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging?.next?.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 20
+            }
+          },
+          "timeout": 15000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "500"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "95d0dcd8-5b0c-55de-a4c8-011fdb88b786",
+      "name": "List Active Owners",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        360
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Collect Directory                    Mode: Run Once for All Items\n// Merges the paginated Users API and Owners API (active + archived) pages.\n// Any failed call marks the directory as unavailable. The scan reports\n// that as a security finding instead of silently returning \"all clear\".\n// ─────────────────────────────────────────────────────────────────────\nconst run = $('Build Run Context & Authenticate').first().json.run;\n\nconst collect = (nodeName) => {\n  const pages = $(nodeName).all();\n  const results = [];\n  let error = null;\n  for (const p of pages) {\n    const body = p.json || {};\n    if (body.error) error = typeof body.error === 'string' ? body.error : body.error.message || 'request_failed';\n    else if (Array.isArray(body.results)) results.push(...body.results);\n    else if (body.status === 'error') error = body.category || body.message || 'request_failed';\n  }\n  return { results, error, pages: pages.length };\n};\n\nconst users = collect('List HubSpot Users');\nconst activeOwners = collect('List Active Owners');\nconst archivedOwners = collect('List Archived Owners');\nconst errors = [\n  users.error ? `users: ${users.error}` : null,\n  activeOwners.error ? `active owners: ${activeOwners.error}` : null,\n  archivedOwners.error ? `archived owners: ${archivedOwners.error}` : null,\n].filter(Boolean).map((e) => String(e).replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]').slice(0, 200));\n\nreturn [{\n  json: {\n    kind: 'directory',\n    run,\n    directory: {\n      ok: errors.length === 0,\n      reason: errors.join('; ') || null,\n      source: 'hubspot_api',\n      pages: { users: users.pages, activeOwners: activeOwners.pages, archivedOwners: archivedOwners.pages },\n      users: users.results,\n      activeOwners: activeOwners.results,\n      archivedOwners: archivedOwners.results,\n    },\n  },\n}];\n"
+      },
+      "id": "9d04cc77-13a9-5ad5-b968-37918c8a476f",
+      "name": "Collect Directory",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Identify Departing Users             Mode: Run Once for All Items\n// Classifies accounts that need an offboarding audit:\n//   deactivated          archived owner (userId null, userIdIncludingInactive set)\n//   pending_offboarding  named in a webhook request / OFFBOARDING_USER_* but still active\n//   suspended_or_unlinked active owner whose user no longer appears in the Users API\n//   unassigned_user      active user with no role and no team (limbo account)\n// Also prepares fallback-owner candidates from the same primary team.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst LOOKBACK_DAYS = Math.max(1, num('DEACTIVATION_LOOKBACK_DAYS', 30));\nconst INCLUDE_ALL_ARCHIVED = flag('INCLUDE_ALL_ARCHIVED_OWNERS', false);\nconst INCLUDE_UNASSIGNED = flag('INCLUDE_UNASSIGNED_USERS', true);\nconst MAX_DEPARTING = Math.max(1, num('MAX_DEPARTING_USERS_PER_RUN', 25));\nconst IGNORE_OWNER_IDS = new Set(csv('IGNORE_OWNER_IDS'));\n\nconst src = $input.first().json;\nconst run = src.run;\nconst dir = src.directory || { ok: false };\n\nif (!dir.ok) {\n  return [{ json: { kind: 'scan_error', run, error: { stage: 'directory', reason: dir.reason || 'directory_unavailable' } } }];\n}\n\nconst nowMs = Date.now();\nconst cutoff = nowMs - LOOKBACK_DAYS * 86400000;\nconst usersById = new Map((dir.users || []).map((u) => [String(u.id), u]));\nconst activeOwners = (dir.activeOwners || []).filter((o) => o && o.type !== 'QUEUE' && o.archived !== true);\nconst activeOwnerByUserId = new Map(activeOwners.filter((o) => o.userId != null).map((o) => [String(o.userId), o]));\nconst ownerName = (o) => [o.firstName, o.lastName].filter(Boolean).join(' ').trim() || o.email || `Owner ${o.id}`;\nconst primaryTeam = (o) => (Array.isArray(o.teams) ? o.teams.find((t) => t.primary) || o.teams[0] : null) || null;\n\nconst departing = new Map(); // ownerId -> record\nconst add = (owner, status, extra = {}) => {\n  if (!owner || IGNORE_OWNER_IDS.has(String(owner.id))) return;\n  const key = String(owner.id);\n  if (departing.has(key)) {\n    const existing = departing.get(key);\n    existing.signals = [...new Set([...existing.signals, status])];\n    return;\n  }\n  const team = primaryTeam(owner);\n  departing.set(key, {\n    ownerId: key,\n    userId: owner.userId != null ? String(owner.userId) : owner.userIdIncludingInactive != null ? String(owner.userIdIncludingInactive) : null,\n    email: owner.email ? String(owner.email).toLowerCase() : null,\n    name: ownerName(owner),\n    status,\n    signals: [status],\n    archived: owner.archived === true,\n    ownerUpdatedAt: owner.updatedAt || null,\n    primaryTeam: team ? { id: String(team.id), name: team.name || null } : null,\n    ...extra,\n  });\n};\n\n// 1 · Deactivated users (archived owners)\nlet skippedOutsideLookback = 0;\nfor (const o of dir.archivedOwners || []) {\n  if (!o || o.type === 'QUEUE') continue;\n  const updated = Date.parse(o.updatedAt || '');\n  if (!INCLUDE_ALL_ARCHIVED && (!Number.isFinite(updated) || updated < cutoff)) { skippedOutsideLookback++; continue; }\n  add(o, 'deactivated');\n}\n\n// 2 · Explicit offboarding requests (webhook or standing list)\nconst requested = (run.request && run.request.users) || [];\nconst unmatchedRequests = [];\nfor (const r of requested) {\n  const owner =\n    (r.ownerId && (activeOwners.find((o) => String(o.id) === r.ownerId) || (dir.archivedOwners || []).find((o) => String(o.id) === r.ownerId))) ||\n    (r.userId && (activeOwnerByUserId.get(r.userId) || (dir.archivedOwners || []).find((o) => String(o.userIdIncludingInactive) === r.userId))) ||\n    (r.email && (activeOwners.find((o) => String(o.email || '').toLowerCase() === r.email) || (dir.archivedOwners || []).find((o) => String(o.email || '').toLowerCase() === r.email)));\n  if (!owner) { unmatchedRequests.push(r.email ? `${r.email[0]}***@${r.email.split('@')[1] || ''}` : r.userId || r.ownerId); continue; }\n  add(owner, owner.archived ? 'deactivated' : 'pending_offboarding', { requested: true });\n}\n\n// 3 · Active owners whose user record is gone (suspended / removed / unlinked)\nfor (const o of activeOwners) {\n  if (o.userId != null && !usersById.has(String(o.userId))) add(o, 'suspended_or_unlinked');\n}\n\n// 4 · Active users with no role and no team\nif (INCLUDE_UNASSIGNED) {\n  for (const u of dir.users || []) {\n    const noRole = !Array.isArray(u.roleIds) || u.roleIds.length === 0;\n    const noTeam = !u.primaryTeamId && (!Array.isArray(u.secondaryTeamIds) || u.secondaryTeamIds.length === 0);\n    if (noRole && noTeam && u.superAdmin !== true) {\n      const owner = activeOwnerByUserId.get(String(u.id));\n      if (owner) add(owner, 'unassigned_user');\n    }\n  }\n}\n\n// Fallback candidates: active owners whose user is active and not departing\nconst departingIds = new Set(departing.keys());\nconst eligibleFallbacks = activeOwners\n  .filter((o) => !departingIds.has(String(o.id)) && o.userId != null && usersById.has(String(o.userId)))\n  .map((o) => ({ ownerId: String(o.id), name: ownerName(o), teamIds: (o.teams || []).map((t) => String(t.id)) }))\n  .sort((a, b) => a.name.localeCompare(b.name));\n\nconst STATUS_ORDER = { deactivated: 0, pending_offboarding: 1, suspended_or_unlinked: 2, unassigned_user: 3 };\nconst list = [...departing.values()].sort((a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status]);\nconst truncated = list.length > MAX_DEPARTING;\n\nconst summary = {\n  activeUsers: (dir.users || []).length,\n  activeOwners: activeOwners.length,\n  archivedOwners: (dir.archivedOwners || []).length,\n  archivedOutsideLookback: skippedOutsideLookback,\n  lookbackDays: LOOKBACK_DAYS,\n  departingFound: list.length,\n  truncated,\n  unmatchedRequests,\n};\n\nif (list.length === 0) {\n  return [{ json: { kind: 'no_departures', run, directorySummary: summary } }];\n}\n\nreturn list.slice(0, MAX_DEPARTING).map((d) => ({\n  json: {\n    kind: 'departing',\n    run,\n    departing: d,\n    fallbackCandidates: eligibleFallbacks.filter((f) => d.primaryTeam && f.teamIds.includes(d.primaryTeam.id)).slice(0, 5),\n    allFallbackOwnerIds: eligibleFallbacks.map((f) => f.ownerId),\n    directorySummary: summary,\n    sandboxEvidence: src.sandboxEvidence ? src.sandboxEvidence[d.ownerId] || null : undefined,\n    sandboxPriorReports: src.sandboxPriorReports,\n  },\n}));\n"
+      },
+      "id": "e4dfe1dd-e505-565c-a336-b27793a62617",
+      "name": "Identify Departing Users",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        240
+      ],
+      "notes": "deactivated · pending_offboarding · suspended_or_unlinked · unassigned_user"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "fdfce722-9f8a-5807-bd11-8261519f81f2",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "departing",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ec811909-2362-5e04-a561-8a75cb551eee",
+      "name": "Departing Users Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2160,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "7e8b324e-c284-58ea-915c-15e653a5cff6",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "82e54a1d-42fd-53fa-9099-7e6f79d5cb0a",
+      "name": "Sandbox Evidence?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2400,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Load Sandbox Evidence                Mode: Run Once for All Items\n// Attaches fictional CRM/sequence evidence to each departing user and adds\n// the fictional workflow definitions, in the exact shape that Collect\n// Evidence produces in live mode.\n// ─────────────────────────────────────────────────────────────────────\nconst items = $input.all().map((i) => i.json);\nconst empty = { ok: true, total: 0, sample: [] };\nconst out = items.map((d) => {\n  const e = d.sandboxEvidence || {};\n  return {\n    json: {\n      ...d,\n      sandboxEvidence: undefined,\n      evidence: {\n        deals: e.deals || empty,\n        tasks: e.tasks || empty,\n        tickets: e.tickets || empty,\n        sequenceContacts: e.sequenceContacts || empty,\n        ownedSequences: e.ownedSequences || empty,\n      },\n    },\n  };\n});\n\nconst fixtures = $('Load Sandbox Directory').first().json;\nconst defs = (fixtures.sandboxEvidence && fixtures.sandboxEvidence.__workflowDefinitions) || [];\nout.push({\n  json: {\n    kind: 'workflow_definitions',\n    ok: true,\n    scanned: defs.length,\n    failed: 0,\n    totalListed: defs.length,\n    truncated: false,\n    listError: null,\n    definitions: defs.map((d) => ({ id: String(d.id), name: d.name, isEnabled: d.isEnabled === true, definition: d })),\n  },\n});\nreturn out;\n"
+      },
+      "id": "a7603b21-ed08-5db9-be17-1ebd434b4e96",
+      "name": "Load Sandbox Evidence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build CRM Search Jobs                Mode: Run Once for All Items\n// Four read-only CRM searches per departing owner:\n//   deals    open deals owned by the rep\n//   tasks    tasks not completed\n//   tickets  tickets not closed\n//   contacts contacts owned by the rep that are currently in a sequence\n// Each search returns `total` plus up to SEARCH_SAMPLE_LIMIT records.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst SAMPLE = Math.min(100, Math.max(1, num('SEARCH_SAMPLE_LIMIT', 25)));\nconst DEAL_CLOSED_STAGES = csv('DEAL_CLOSED_STAGE_IDS');\nconst TICKET_CLOSED_STAGES = csv('TICKET_CLOSED_STAGE_IDS');\nconst SEQUENCE_PROPERTY = env('CONTACT_SEQUENCE_ENROLLED_PROPERTY', 'hs_sequences_is_enrolled');\n\nconst owner = (id) => ({ propertyName: 'hubspot_owner_id', operator: 'EQ', value: String(id) });\nconst jobs = [];\n\n$input.all().forEach(({ json }, index) => {\n  const id = json.departing.ownerId;\n  const dealOpen = DEAL_CLOSED_STAGES.length\n    ? { propertyName: 'dealstage', operator: 'NOT_IN', values: DEAL_CLOSED_STAGES }\n    : { propertyName: 'hs_is_closed', operator: 'EQ', value: 'false' };\n  const ticketOpen = TICKET_CLOSED_STAGES.length\n    ? { propertyName: 'hs_pipeline_stage', operator: 'NOT_IN', values: TICKET_CLOSED_STAGES }\n    : { propertyName: 'closed_date', operator: 'NOT_HAS_PROPERTY' };\n  const specs = [\n    { jobType: 'deals', objectType: 'deals', filters: [owner(id), dealOpen], properties: ['dealname', 'amount', 'closedate', 'dealstage', 'pipeline'], sorts: [{ propertyName: 'closedate', direction: 'ASCENDING' }] },\n    { jobType: 'tasks', objectType: 'tasks', filters: [owner(id), { propertyName: 'hs_task_status', operator: 'NEQ', value: 'COMPLETED' }], properties: ['hs_task_subject', 'hs_timestamp', 'hs_task_status', 'hs_task_priority'], sorts: [{ propertyName: 'hs_timestamp', direction: 'ASCENDING' }] },\n    { jobType: 'tickets', objectType: 'tickets', filters: [owner(id), ticketOpen], properties: ['subject', 'hs_ticket_priority', 'hs_pipeline_stage', 'createdate'], sorts: [{ propertyName: 'createdate', direction: 'ASCENDING' }] },\n    { jobType: 'sequence_contacts', objectType: 'contacts', filters: [owner(id), { propertyName: SEQUENCE_PROPERTY, operator: 'EQ', value: 'true' }], properties: ['hs_object_id', SEQUENCE_PROPERTY], sorts: [] },\n  ];\n  for (const s of specs) {\n    jobs.push({\n      json: {\n        departingIndex: index,\n        ownerId: id,\n        jobType: s.jobType,\n        objectType: s.objectType,\n        // Contact samples are IDs only: no names or emails leave HubSpot.\n        searchBody: { filterGroups: [{ filters: s.filters }], properties: s.properties, sorts: s.sorts, limit: SAMPLE },\n      },\n    });\n  }\n});\n\nreturn jobs;\n"
+      },
+      "id": "5e6085b5-7ea9-5d0e-9587-e2cf24fab144",
+      "name": "Build CRM Search Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Build Run Context & Authenticate').first().json.run.hubspotApiBase }}/crm/v3/objects/{{ $json.objectType }}/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 15000,
+          "batching": {
+            "batch": {
+              "batchSize": 4,
+              "batchInterval": 1100
+            }
+          }
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.searchBody) }}"
+      },
+      "id": "3af90dcd-4de5-5879-ae33-690ca16abc67",
+      "name": "Run CRM Orphan Searches",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        320
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Deals, tasks, tickets, contacts-in-sequence per departing owner. Read-only."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Sequence Lookups               Mode: Run Once for All Items\n// GET /automation/v4/sequences requires a userId, so one lookup per\n// departing user. Always emits at least one item so the chain continues;\n// placeholder items are ignored by Collect Evidence.\n// ─────────────────────────────────────────────────────────────────────\nconst departing = $('Departing Users Found?').all();\nconst out = departing\n  .map(({ json }, index) => ({ json: { departingIndex: index, ownerId: json.departing.ownerId, userId: json.departing.userId, placeholder: !json.departing.userId } }));\nreturn out.length ? out : [{ json: { departingIndex: -1, ownerId: null, userId: '0', placeholder: true } }];\n"
+      },
+      "id": "b676b21f-3c85-54c1-9fff-244ed56e5ad3",
+      "name": "Build Sequence Lookups",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Build Run Context & Authenticate').first().json.run.hubspotApiBase }}/automation/v4/sequences",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 15000,
+          "batching": {
+            "batch": {
+              "batchSize": 4,
+              "batchInterval": 1100
+            }
+          }
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "userId",
+              "value": "={{ $json.userId || '0' }}"
+            },
+            {
+              "name": "limit",
+              "value": "100"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "54c35527-5310-53b8-8927-35ec17a5cd18",
+      "name": "Fetch Owned Sequences",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        320
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "userId is required by the API. Scope: automation.sequences.read."
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Build Run Context & Authenticate').first().json.run.hubspotApiBase }}/automation/v4/flows",
+        "options": {
+          "pagination": {
+            "pagination": {
+              "paginationMode": "updateAParameterInEachRequest",
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "after",
+                    "value": "={{ $response.body.paging?.next?.after }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ !$response.body.paging?.next?.after }}",
+              "limitPagesFetched": true,
+              "maxRequests": 25
+            }
+          },
+          "timeout": 15000
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "limit",
+              "value": "100"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "e56614d6-fc0f-5234-b6d2-efd29daf5704",
+      "name": "List Workflows (v4)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3600,
+        320
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "executeOnce": true,
+      "notes": "Scope: automation."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Workflow Scan Jobs             Mode: Run Once for All Items\n// The v4 list only returns key fields, so each workflow definition is\n// fetched and scanned for references to the departing users. Enabled\n// workflows first, capped by MAX_WORKFLOWS_TO_SCAN.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst MAX = Math.max(1, num('MAX_WORKFLOWS_TO_SCAN', 300));\nconst INCLUDE_DISABLED = flag('SCAN_DISABLED_WORKFLOWS', true);\n\nconst flows = [];\nlet listError = null;\nfor (const page of $input.all()) {\n  const body = page.json || {};\n  if (body.error) listError = typeof body.error === 'string' ? body.error : body.error.message || 'flows_list_failed';\n  if (Array.isArray(body.results)) flows.push(...body.results);\n}\n\nconst selected = flows\n  .filter((f) => f && f.id != null && (INCLUDE_DISABLED || f.isEnabled === true))\n  .sort((a, b) => Number(b.isEnabled === true) - Number(a.isEnabled === true))\n  .slice(0, MAX);\n\nif (!selected.length) {\n  return [{ json: { flowId: '0', placeholder: true, listError: listError ? String(listError).slice(0, 200) : null, totalListed: flows.length } }];\n}\nreturn selected.map((f) => ({\n  json: { flowId: String(f.id), isEnabled: f.isEnabled === true, name: f.name || null, placeholder: false, totalListed: flows.length, truncated: flows.length > MAX, listError: null },\n}));\n"
+      },
+      "id": "f859d5d1-aeac-5f22-9efc-156e2f4bf8af",
+      "name": "Build Workflow Scan Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Build Run Context & Authenticate').first().json.run.hubspotApiBase }}/automation/v4/flows/{{ encodeURIComponent($json.flowId) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 15000,
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "ca24088f-cc0d-5654-9c0f-7ca832f7a0e4",
+      "name": "Fetch Workflow Definitions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4080,
+        320
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Collect Evidence                     Mode: Run Once for All Items\n// Pairs every HTTP response with the job that produced it (n8n keeps item\n// order per node) and emits:\n//   • one `departing` item per user with CRM + sequence evidence\n//   • one `workflow_definitions` item shared by the scanner\n// ─────────────────────────────────────────────────────────────────────\nconst departing = $('Departing Users Found?').all().map((i) => i.json);\nconst searchJobs = $('Build CRM Search Jobs').all().map((i) => i.json);\nconst searchRes = $('Run CRM Orphan Searches').all().map((i) => i.json);\nconst seqJobs = $('Build Sequence Lookups').all().map((i) => i.json);\nconst seqRes = $('Fetch Owned Sequences').all().map((i) => i.json);\nconst flowJobs = $('Build Workflow Scan Jobs').all().map((i) => i.json);\nconst flowRes = $input.all().map((i) => i.json);\n\nconst clean = (s) => String(s || '').replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]').slice(0, 200);\nconst failure = (r) => ({ ok: false, statusCode: Number(r && r.statusCode) || null, reason: clean((r && r.body && (r.body.category || r.body.message)) || (r && r.error && (r.error.message || r.error)) || 'request_failed') });\n\nconst shapeRecord = (jobType, rec) => {\n  const p = rec.properties || {};\n  if (jobType === 'deals') return { id: String(rec.id), name: p.dealname || null, amount: p.amount != null && p.amount !== '' ? Number(p.amount) : null, closeDate: p.closedate || null, stage: p.dealstage || null, pipeline: p.pipeline || null };\n  if (jobType === 'tasks') return { id: String(rec.id), subject: p.hs_task_subject || null, dueAt: p.hs_timestamp || null, status: p.hs_task_status || null, priority: p.hs_task_priority || null };\n  if (jobType === 'tickets') return { id: String(rec.id), subject: p.subject || null, priority: p.hs_ticket_priority || null, stage: p.hs_pipeline_stage || null, createdAt: p.createdate || null };\n  return { id: String(rec.id) }; // contacts: ID only\n};\n\nconst out = departing.map((d, index) => {\n  const evidence = {};\n  searchJobs.forEach((job, i) => {\n    if (job.departingIndex !== index) return;\n    const r = searchRes[i] || {};\n    const key = job.jobType === 'sequence_contacts' ? 'sequenceContacts' : job.jobType;\n    if (Number(r.statusCode) === 200 && r.body) {\n      const results = Array.isArray(r.body.results) ? r.body.results : [];\n      evidence[key] = { ok: true, total: Number(r.body.total ?? results.length), sample: results.map((rec) => shapeRecord(job.jobType, rec)) };\n    } else {\n      evidence[key] = failure(r);\n    }\n  });\n  const si = seqJobs.findIndex((j) => j.departingIndex === index);\n  if (si === -1 || seqJobs[si].placeholder) {\n    evidence.ownedSequences = { ok: false, statusCode: null, reason: 'no_user_id_for_owner' };\n  } else {\n    const r = seqRes[si] || {};\n    if (Number(r.statusCode) === 200 && r.body) {\n      const results = Array.isArray(r.body.results) ? r.body.results : [];\n      evidence.ownedSequences = { ok: true, total: Number(r.body.total ?? results.length), sample: results.slice(0, 25).map((s) => ({ id: String(s.id), name: s.name || null })) };\n    } else {\n      evidence.ownedSequences = failure(r);\n    }\n  }\n  return { json: { ...d, evidence } };\n});\n\nconst definitions = [];\nlet flowErrors = 0;\nflowJobs.forEach((job, i) => {\n  if (job.placeholder) return;\n  const r = flowRes[i] || {};\n  if (Number(r.statusCode) === 200 && r.body) definitions.push({ id: job.flowId, name: r.body.name || job.name || `Workflow ${job.flowId}`, isEnabled: r.body.isEnabled ?? job.isEnabled, definition: r.body });\n  else flowErrors++;\n});\nconst placeholder = flowJobs.find((j) => j.placeholder);\n\nout.push({\n  json: {\n    kind: 'workflow_definitions',\n    ok: !(placeholder && placeholder.listError) && flowErrors === 0,\n    scanned: definitions.length,\n    failed: flowErrors,\n    totalListed: flowJobs.length ? flowJobs[0].totalListed : 0,\n    truncated: flowJobs.length ? !!flowJobs[0].truncated : false,\n    listError: placeholder ? placeholder.listError : null,\n    definitions,\n  },\n});\nreturn out;\n"
+      },
+      "id": "b5a96f2f-741b-58e8-8457-7cb61687639d",
+      "name": "Collect Evidence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4320,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Orphaned Asset & Data Scanner        Mode: Run Once for All Items\n// Cross-references each departing user against:\n//   workflows   definitions that reference their owner ID, user ID or email\n//   sequences   contacts they own that are currently enrolled + sequences they own\n//   deals       open deals (closing soon / high value flagged)\n//   tasks       open tasks (overdue flagged)\n//   tickets     open tickets (high priority flagged)\n// and assigns a risk score and tier.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst CLOSING_SOON_DAYS = Math.max(1, num('DEAL_CLOSING_SOON_DAYS', 30));\nconst HIGH_VALUE = Math.max(0, num('HIGH_VALUE_DEAL_AMOUNT', 50000));\nconst HIGH_PRIORITY_TICKETS = new Set(csv('HIGH_PRIORITY_TICKET_VALUES', 'HIGH,URGENT').map((s) => s.toUpperCase()));\n\nconst all = $input.all().map((i) => i.json);\nconst defsItem = all.find((i) => i.kind === 'workflow_definitions') || { ok: false, definitions: [], scanned: 0 };\nconst departing = all.filter((i) => i.kind === 'departing');\nconst nowMs = Date.now();\n\n// ── Workflow reference scan ───────────────────────────────────────────\nconst REF_KEY = /(owner|user|assign|recipient|notif|rotat|sender|cc|to_email|email)/i;\nconst OWNER_CONTEXT = /hubspot_owner_id|owner/i;\nconst classify = (path, ctx) => {\n  const t = `${path} ${ctx}`.toLowerCase();\n  if (t.includes('enrollmentcriteria') || t.includes('reenrollment')) return 'enrollment_filter';\n  if (/rotat/.test(t)) return 'owner_rotation';\n  if (/notif|recipient|cc|to_email/.test(t)) return 'internal_notification';\n  if (/task/.test(t)) return 'task_assignment';\n  if (/owner/.test(t)) return 'owner_assignment';\n  return 'user_reference';\n};\n\nfunction scanDefinition(def, ids, email) {\n  const refs = [];\n  const walk = (node, path, ctx, ownerCtx) => {\n    if (refs.length >= 20) return;\n    if (Array.isArray(node)) { node.forEach((v, i) => walk(v, `${path}[${i}]`, ctx, ownerCtx)); return; }\n    if (node && typeof node === 'object') {\n      const strings = Object.values(node).filter((v) => typeof v === 'string').join(' ');\n      const childCtx = `${ctx} ${strings}`.slice(-300);\n      const childOwnerCtx = ownerCtx || OWNER_CONTEXT.test(strings);\n      for (const [k, v] of Object.entries(node)) {\n        if (['id', 'revisionId', 'portalId', 'createdAt', 'updatedAt', 'actionId', 'nextActionId'].includes(k) && path === '') continue;\n        walk(v, path ? `${path}.${k}` : k, childCtx, childOwnerCtx);\n      }\n      return;\n    }\n    if (node === null || node === undefined) return;\n    const value = String(node);\n    if (email && value.toLowerCase().includes(email)) { refs.push({ path, kind: 'email_reference' }); return; }\n    if (ids.has(value) && (REF_KEY.test(path) || ownerCtx)) refs.push({ path, kind: classify(path, ctx) });\n  };\n  walk(def, '', '', false);\n  return refs;\n}\n\nconst count = (e) => (e && e.ok ? Number(e.total || 0) : 0);\nconst out = [];\n\nfor (const d of departing) {\n  const person = d.departing;\n  const e = d.evidence || {};\n  const ids = new Set([person.ownerId, person.userId].filter(Boolean).map(String));\n  const email = person.email || null;\n\n  const evidenceErrors = [];\n  for (const [k, v] of Object.entries(e)) if (!v || !v.ok) evidenceErrors.push({ source: k, statusCode: v ? v.statusCode : null, reason: v ? v.reason : 'missing' });\n  if (!defsItem.ok) evidenceErrors.push({ source: 'workflows', statusCode: null, reason: defsItem.listError || `${defsItem.failed || 0} definitions failed to load` });\n\n  // Workflows\n  const workflowHits = [];\n  for (const wf of defsItem.definitions || []) {\n    const refs = scanDefinition(wf.definition, ids, email);\n    if (refs.length) workflowHits.push({ id: wf.id, name: wf.name, isEnabled: wf.isEnabled === true, references: refs, kinds: [...new Set(refs.map((r) => r.kind))] });\n  }\n  const enabledWorkflows = workflowHits.filter((w) => w.isEnabled);\n  const disabledWorkflows = workflowHits.filter((w) => !w.isEnabled);\n\n  // Deals\n  const dealSample = (e.deals && e.deals.sample) || [];\n  const soonCutoff = nowMs + CLOSING_SOON_DAYS * 86400000;\n  const closingSoon = dealSample.filter((x) => { const t = Date.parse(x.closeDate || ''); return Number.isFinite(t) && t <= soonCutoff; });\n  const highValue = dealSample.filter((x) => Number.isFinite(x.amount) && x.amount >= HIGH_VALUE);\n  const sampleAmount = dealSample.reduce((s, x) => s + (Number.isFinite(x.amount) ? x.amount : 0), 0);\n\n  // Tasks & tickets\n  const taskSample = (e.tasks && e.tasks.sample) || [];\n  const overdue = taskSample.filter((x) => { const t = Date.parse(x.dueAt || ''); return Number.isFinite(t) && t < nowMs; });\n  const ticketSample = (e.tickets && e.tickets.sample) || [];\n  const highTickets = ticketSample.filter((x) => HIGH_PRIORITY_TICKETS.has(String(x.priority || '').toUpperCase()));\n\n  const findings = {\n    workflows: { enabled: enabledWorkflows, disabled: disabledWorkflows, scanned: defsItem.scanned || 0, truncated: !!defsItem.truncated },\n    sequenceContacts: { total: count(e.sequenceContacts), sampleIds: ((e.sequenceContacts && e.sequenceContacts.sample) || []).map((x) => x.id).slice(0, 10) },\n    ownedSequences: { total: count(e.ownedSequences), sample: (e.ownedSequences && e.ownedSequences.sample) || [] },\n    deals: { total: count(e.deals), closingSoon, highValue, sampleAmount, sampleSize: dealSample.length, sample: dealSample.slice(0, 10) },\n    tasks: { total: count(e.tasks), overdue: overdue.length, overdueSampleOnly: taskSample.length < count(e.tasks), sample: taskSample.slice(0, 10) },\n    tickets: { total: count(e.tickets), highPriority: highTickets, sample: ticketSample.slice(0, 10) },\n  };\n\n  // Risk score (documented in README §5)\n  let score = 0;\n  score += enabledWorkflows.length * 25;\n  score += disabledWorkflows.length * 3;\n  if (findings.sequenceContacts.total > 0) score += 20 + Math.min(20, Math.ceil(findings.sequenceContacts.total / 5));\n  score += closingSoon.length * 10 + highValue.length * 10;\n  score += Math.min(20, findings.deals.total * 2);\n  score += Math.min(10, overdue.length);\n  score += highTickets.length * 5 + Math.min(10, findings.tickets.total);\n  score += Math.min(5, Math.ceil(findings.tasks.total / 5));\n  score += findings.ownedSequences.total > 0 ? 3 : 0;\n  if (person.status === 'pending_offboarding') score += 5; // access still live\n\n  let tier = score >= 60 ? 'critical' : score >= 30 ? 'high' : score >= 10 ? 'medium' : score > 0 ? 'low' : 'none';\n  if (evidenceErrors.length && (tier === 'none' || tier === 'low')) tier = 'medium'; // incomplete scan is never \"clean\"\n\n  out.push({ json: { ...d, evidence: undefined, findings, evidenceErrors, risk: { score, tier } } });\n}\n\nreturn out;\n"
+      },
+      "id": "eece1c08-7663-563a-b2fd-cfa1e7f0b81f",
+      "name": "Orphaned Asset & Data Scanner",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        160
+      ],
+      "notes": "Cross-references departing IDs against workflows, sequences, open deals, tasks and tickets. Risk score + tier."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Reassignment Checklist Generator     Mode: Run Once for All Items\n// Builds one prioritised audit report per departing user:\n//   P0 · today      live automation and revenue at risk\n//   P1 · 3 days     open pipeline, customer tickets, overdue work\n//   P2 · 7 days     housekeeping (open tasks, owned sequences, disabled workflows)\n// Resolves a recommended fallback owner, fingerprints the findings and\n// suppresses unchanged reports inside REPORT_COOLDOWN_HOURS (scheduled runs).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst PERSIST = !SANDBOX_MODE && !DRY_RUN;\nconst COOLDOWN_HOURS = Math.max(1, num('REPORT_COOLDOWN_HOURS', 72));\nconst NOTIFY_ON_CLEAN = flag('NOTIFY_ON_CLEAN', false);\nconst DEFAULT_FALLBACK = env('DEFAULT_FALLBACK_OWNER_ID', '');\nconst PORTAL = env('HUBSPOT_PORTAL_ID', 'YOUR_HUBSPOT_PORTAL_ID');\nconst APP = env('HUBSPOT_APP_BASE_URL', 'https://app.hubspot.com').replace(/\\/+$/, '');\nlet FALLBACK_MAP = {};\ntry { FALLBACK_MAP = JSON.parse(env('FALLBACK_OWNER_MAP', '{}')) || {}; } catch (error) { FALLBACK_MAP = {}; }\n\nconst items = $input.all().map((i) => i.json);\nconst nowMs = Date.now();\nconst run = items.length ? items[0].run : {};\nconst isWebhook = run && run.trigger === 'webhook';\n\n// ── Report ledger (dedupe) ────────────────────────────────────────────\nconst staticData = $getWorkflowStaticData('global');\nlet ledger;\nif (PERSIST) {\n  staticData.hsOffboardingSanitizer = staticData.hsOffboardingSanitizer || { version: 1, reports: {} };\n  ledger = staticData.hsOffboardingSanitizer.reports;\n} else if (SANDBOX_MODE) {\n  ledger = {};\n  const prior = (items.find((i) => i.sandboxPriorReports) || {}).sandboxPriorReports || [];\n  for (const p of prior) ledger[String(p.ownerId)] = { fingerprint: p.fingerprint, at: nowMs - Number(p.hoursAgo || 0) * 3600000 };\n} else {\n  ledger = JSON.parse(JSON.stringify((staticData.hsOffboardingSanitizer && staticData.hsOffboardingSanitizer.reports) || {}));\n}\nfor (const [k, v] of Object.entries(ledger)) if (!v || nowMs - v.at > 30 * 86400000) delete ledger[k];\n\nconst links = {\n  users: `${APP}/settings/${encodeURIComponent(PORTAL)}/users`,\n  deals: `${APP}/contacts/${encodeURIComponent(PORTAL)}/objects/0-3/views/all/list`,\n  tasks: `${APP}/contacts/${encodeURIComponent(PORTAL)}/objects/0-27/views/all/list`,\n  tickets: `${APP}/contacts/${encodeURIComponent(PORTAL)}/objects/0-5/views/all/list`,\n  contacts: `${APP}/contacts/${encodeURIComponent(PORTAL)}/objects/0-1/views/all/list`,\n  sequences: `${APP}/sequences/${encodeURIComponent(PORTAL)}`,\n  workflow: (id) => `${APP}/workflows/${encodeURIComponent(PORTAL)}/platform/flow/${encodeURIComponent(id)}/edit`,\n};\nconst fmtMoney = (n) => (Number.isFinite(n) ? n.toLocaleString('en-US', { maximumFractionDigits: 0 }) : 'n/a');\n\nfunction resolveFallback(d) {\n  const valid = new Set(d.allFallbackOwnerIds || []);\n  const teamId = d.departing.primaryTeam ? d.departing.primaryTeam.id : null;\n  if (teamId && FALLBACK_MAP[teamId]) {\n    const id = String(FALLBACK_MAP[teamId]);\n    return valid.has(id) ? { ownerId: id, name: null, source: 'team_fallback_map' } : { ownerId: id, name: null, source: 'team_fallback_map', warning: 'mapped fallback owner is not an active user' };\n  }\n  const candidate = (d.fallbackCandidates || [])[0];\n  if (candidate) return { ownerId: candidate.ownerId, name: candidate.name, source: 'same_primary_team_suggestion', note: 'Suggestion only: confirm with the team lead.' };\n  if (DEFAULT_FALLBACK) return valid.has(DEFAULT_FALLBACK) ? { ownerId: DEFAULT_FALLBACK, name: null, source: 'default_fallback_owner' } : { ownerId: DEFAULT_FALLBACK, name: null, source: 'default_fallback_owner', warning: 'default fallback owner is not an active user' };\n  return { ownerId: null, name: null, source: 'manual_selection_required' };\n}\n\nconst out = [];\nfor (const d of items) {\n  if (d.kind === 'scan_error') {\n    const key = '__scan_error__';\n    const prev = ledger[key];\n    const suppressed = !isWebhook && prev && nowMs - prev.at < 6 * 3600000;\n    if (!suppressed) ledger[key] = { fingerprint: 'scan_error', at: nowMs };\n    out.push({ json: { kind: 'scan_error', run, route: suppressed ? 'suppressed' : 'notify', notify: !suppressed, report: { title: 'Offboarding scan could not read the HubSpot user directory', tier: 'critical', error: d.error } } });\n    continue;\n  }\n  if (d.kind === 'no_departures') {\n    out.push({ json: { kind: 'no_departures', run, route: NOTIFY_ON_CLEAN ? 'notify' : 'clean', notify: NOTIFY_ON_CLEAN, report: { title: 'No departing HubSpot users found', tier: 'none', directorySummary: d.directorySummary } } });\n    continue;\n  }\n\n  const p = d.departing;\n  const f = d.findings;\n  const fallback = resolveFallback(d);\n  const owner = fallback.ownerId ? `owner ${fallback.ownerId}${fallback.name ? ` (${fallback.name})` : ''}` : 'a fallback owner (choose manually)';\n  const checklist = [];\n  const push = (priority, assetType, count, title, action, link, sample) => { if (count > 0) checklist.push({ id: `${p.ownerId}:${assetType}:${priority}`, priority, assetType, count, title, action, recommendedOwner: fallback, hubspotLink: link, sample: sample || [] }); };\n\n  // P0\n  for (const wf of f.workflows.enabled) {\n    push('P0', 'workflow', wf.references.length, `Active workflow references this user: ${wf.name}`,\n      `Replace the user in ${wf.kinds.join(', ').replace(/_/g, ' ')} with ${owner}. Rotations and notifications that point at a deactivated user fail or skip silently.`,\n      links.workflow(wf.id), wf.references.slice(0, 5).map((r) => `${r.kind}: ${r.path}`));\n  }\n  push('P0', 'sequence_enrollment', f.sequenceContacts.total, `${f.sequenceContacts.total} owned contacts are still enrolled in sequences`,\n    `Unenroll or pause these sequence enrollments before the user's inbox and calendar are disconnected, then decide with ${owner} whether to re-enroll.`, links.contacts, f.sequenceContacts.sampleIds.map((id) => `contact ${id}`));\n  const urgentDeals = [...new Map([...f.deals.closingSoon, ...f.deals.highValue].map((x) => [x.id, x])).values()];\n  push('P0', 'deal_at_risk', urgentDeals.length, `${urgentDeals.length} open deals closing soon or high value`,\n    `Reassign hubspot_owner_id to ${owner} today and brief them before the next customer touchpoint.`, links.deals,\n    urgentDeals.slice(0, 5).map((x) => `${x.name || x.id} · ${fmtMoney(x.amount)} · close ${x.closeDate || 'n/a'}`));\n  if (p.status === 'pending_offboarding') {\n    checklist.push({ id: `${p.ownerId}:access:P0`, priority: 'P0', assetType: 'user_access', count: 1, title: 'User is still active in HubSpot', action: 'Deactivate the user (or remove their seat) on the effective date, after ownership is transferred. Check that their private app tokens and integrations are revoked.', recommendedOwner: fallback, hubspotLink: links.users, sample: [] });\n  }\n  // P1\n  push('P1', 'open_deals', Math.max(0, f.deals.total - urgentDeals.length), `${Math.max(0, f.deals.total - urgentDeals.length)} other open deals`, `Bulk-reassign hubspot_owner_id to ${owner} with a saved view filtered on this owner.`, links.deals, f.deals.sample.filter((x) => !urgentDeals.find((u) => u.id === x.id)).slice(0, 5).map((x) => `${x.name || x.id} · ${fmtMoney(x.amount)}`));\n  push('P1', 'open_tickets', f.tickets.total, `${f.tickets.total} open tickets${f.tickets.highPriority.length ? ` (${f.tickets.highPriority.length} high priority)` : ''}`, `Reassign to ${owner} or the support queue. Handle high-priority tickets first and tell the customers who their new contact is.`, links.tickets, f.tickets.sample.slice(0, 5).map((x) => `${x.subject || x.id} · ${x.priority || 'no priority'}`));\n  push('P1', 'overdue_tasks', f.tasks.overdue, `${f.tasks.overdue} overdue tasks${f.tasks.overdueSampleOnly ? ' (counted from sample)' : ''}`, `Reassign to ${owner} or close them if they're no longer relevant.`, links.tasks, f.tasks.sample.filter((x) => Date.parse(x.dueAt || '') < nowMs).slice(0, 5).map((x) => `${x.subject || x.id} · due ${x.dueAt || 'n/a'}`));\n  // P2\n  push('P2', 'open_tasks', Math.max(0, f.tasks.total - f.tasks.overdue), `${Math.max(0, f.tasks.total - f.tasks.overdue)} other open tasks`, `Reassign to ${owner}.`, links.tasks, []);\n  push('P2', 'owned_sequences', f.ownedSequences.total, `${f.ownedSequences.total} sequences owned by this user`, `Clone or share these sequences with ${owner} if they're still used, so the templates aren't lost.`, links.sequences, f.ownedSequences.sample.slice(0, 5).map((s) => s.name || s.id));\n  for (const wf of f.workflows.disabled) {\n    push('P2', 'disabled_workflow', wf.references.length, `Disabled workflow still references this user: ${wf.name}`, 'Update the reference before anyone turns this workflow back on.', links.workflow(wf.id), wf.references.slice(0, 3).map((r) => `${r.kind}: ${r.path}`));\n  }\n  for (const err of d.evidenceErrors || []) {\n    checklist.push({ id: `${p.ownerId}:scan_gap:${err.source}`, priority: 'P1', assetType: 'scan_gap', count: 1, title: `Could not check ${err.source}`, action: `Review ${err.source} manually: the API returned ${err.statusCode || 'an error'} (${err.reason || 'unknown'}).`, recommendedOwner: fallback, hubspotLink: links.users, sample: [] });\n  }\n\n  const order = { P0: 0, P1: 1, P2: 2 };\n  checklist.sort((a, b) => order[a.priority] - order[b.priority]);\n\n  const fingerprint = `deals:${f.deals.total}|tasks:${f.tasks.total}|tickets:${f.tickets.total}|seqContacts:${f.sequenceContacts.total}|sequences:${f.ownedSequences.total}|workflows:${f.workflows.enabled.length + f.workflows.disabled.length}`;\n  const prev = ledger[p.ownerId];\n  let route;\n  if (d.risk.tier === 'none') route = NOTIFY_ON_CLEAN ? 'notify' : 'clean';\n  else if (!isWebhook && prev && prev.fingerprint === fingerprint && nowMs - prev.at < COOLDOWN_HOURS * 3600000) route = 'suppressed';\n  else route = 'notify';\n  if (route === 'notify') ledger[p.ownerId] = { fingerprint, at: nowMs };\n\n  const groups = { P0: checklist.filter((c) => c.priority === 'P0'), P1: checklist.filter((c) => c.priority === 'P1'), P2: checklist.filter((c) => c.priority === 'P2') };\n  out.push({\n    json: {\n      kind: 'report',\n      run,\n      route,\n      notify: route === 'notify',\n      suppression: route === 'suppressed' ? { reason: 'unchanged_since_last_report', hoursSinceLastReport: Math.round((nowMs - prev.at) / 3600000), cooldownHours: COOLDOWN_HOURS } : null,\n      report: {\n        title: `Offboarding audit · ${p.name}`,\n        person: { ownerId: p.ownerId, userId: p.userId, name: p.name, emailMasked: p.email ? `${p.email[0]}***@${p.email.split('@')[1]}` : null, status: p.status, signals: p.signals, primaryTeam: p.primaryTeam, ownerUpdatedAt: p.ownerUpdatedAt, requested: !!p.requested },\n        tier: d.risk.tier,\n        score: d.risk.score,\n        fingerprint,\n        fallbackOwner: fallback,\n        counts: { enabledWorkflows: f.workflows.enabled.length, disabledWorkflows: f.workflows.disabled.length, sequenceContacts: f.sequenceContacts.total, ownedSequences: f.ownedSequences.total, openDeals: f.deals.total, dealsAtRisk: urgentDeals.length, sampleDealAmount: f.deals.sampleAmount, openTasks: f.tasks.total, overdueTasks: f.tasks.overdue, openTickets: f.tickets.total, highPriorityTickets: f.tickets.highPriority.length },\n        checklist,\n        groups: { P0: groups.P0.length, P1: groups.P1.length, P2: groups.P2.length },\n        evidenceErrors: d.evidenceErrors || [],\n        workflowsScanned: f.workflows.scanned,\n        request: run.request && p.requested ? { requestId: run.request.requestId, effectiveDate: run.request.effectiveDate } : null,\n        links: { users: links.users },\n      },\n    },\n  });\n}\n\nreturn out;\n"
+      },
+      "id": "e6dcb726-eaca-55d5-ac2f-4b82814f35b1",
+      "name": "Reassignment Checklist Generator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4800,
+        240
+      ],
+      "notes": "P0/P1/P2 checklist, fallback owner, fingerprint dedupe."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "fa47ca33-316f-5044-8d86-c01a7ed4f928",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a8b0ce04-3dbb-5bad-a99f-8884b5148009",
+      "name": "Notify?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5040,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Notifications                  Mode: Run Once for Each Item\n// Builds both channel payloads from one report:\n//   slackMessage  Block Kit for the RevOps security channel (incoming webhook)\n//   todoistPlan   one parent task + one sub-task per checklist item (API v1)\n// Delivery per channel: live | dry_run | disabled | not_configured\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst CHANNELS = new Set(csv('NOTIFY_CHANNELS', 'slack,todoist').map((c) => c.toLowerCase()));\nconst MENTION = env('SLACK_MENTION_ON_CRITICAL', '');\nconst TODOIST_PROJECT = env('TODOIST_PROJECT_ID', '');\nconst TODOIST_SECTION = env('TODOIST_SECTION_ID', '');\nconst TODOIST_LABELS = csv('TODOIST_LABELS', 'offboarding,hubspot,revops-security');\nconst MAX_SUBTASKS = Math.max(1, num('TODOIST_MAX_SUBTASKS', 25));\n\nconst item = $json;\nconst r = item.report || {};\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst TIER_ICON = { critical: '🔴', high: '🟠', medium: '🟡', low: '🔵', none: '⚪' };\nconst STATUS_LABEL = { deactivated: 'Deactivated', pending_offboarding: 'Pending offboarding (still active)', suspended_or_unlinked: 'Suspended / unlinked owner', unassigned_user: 'Unassigned user (no role, no team)' };\nconst PRIORITY_TODOIST = { P0: 4, P1: 3, P2: 2 }; // 4 = urgent in the Todoist API\nconst DUE = { P0: 'today', P1: 'in 3 days', P2: 'in 7 days' };\n\nconst blocks = [];\nlet text;\n\nif (item.kind === 'scan_error') {\n  text = 'CRITICAL: HubSpot offboarding scan failed. User directory unavailable.';\n  blocks.push({ type: 'header', text: { type: 'plain_text', text: '🔴 Offboarding scan failed', emoji: true } });\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `The scan couldn't read the HubSpot user directory, so departing users *weren't checked* this run.\\n*Stage:* ${esc(r.error && r.error.stage)}\\n*Reason:* ${esc(r.error && r.error.reason)}` } });\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: '*Next steps*\\n1. Check that the private app token is valid and has the `settings.users.read` and `crm.objects.owners.read` scopes.\\n2. Re-run the workflow manually once it is fixed.' } });\n} else if (item.kind === 'no_departures') {\n  text = 'HubSpot offboarding scan: no departing users found.';\n  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `✅ *Offboarding scan clean.* ${esc(r.directorySummary ? r.directorySummary.activeOwners : '?')} active owners, ${esc(r.directorySummary ? r.directorySummary.archivedOwners : '?')} archived owners checked.` } });\n} else {\n  const p = r.person || {};\n  const c = r.counts || {};\n  const icon = TIER_ICON[r.tier] || '⚪';\n  text = `${String(r.tier || '').toUpperCase()}: offboarding audit for ${p.name} (${STATUS_LABEL[p.status] || p.status}). ${r.groups.P0} P0, ${r.groups.P1} P1, ${r.groups.P2} P2 actions.`;\n  blocks.push({ type: 'header', text: { type: 'plain_text', text: `${icon} Offboarding audit · ${String(p.name || '').slice(0, 100)}`.slice(0, 150), emoji: true } });\n  if (r.tier === 'critical' && MENTION) blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${MENTION} critical orphaned-asset risk` } });\n  blocks.push({\n    type: 'section',\n    fields: [\n      { type: 'mrkdwn', text: `*Status*\\n${esc(STATUS_LABEL[p.status] || p.status)}` },\n      { type: 'mrkdwn', text: `*Risk*\\n${esc(String(r.tier).toUpperCase())} (score ${esc(r.score)})` },\n      { type: 'mrkdwn', text: `*Owner ID / User ID*\\n\\`${esc(p.ownerId)}\\` / \\`${esc(p.userId || 'n/a')}\\`` },\n      { type: 'mrkdwn', text: `*Team*\\n${esc(p.primaryTeam ? p.primaryTeam.name || p.primaryTeam.id : 'none')}` },\n      { type: 'mrkdwn', text: `*Email*\\n${esc(p.emailMasked || 'n/a')}` },\n      { type: 'mrkdwn', text: `*Fallback owner*\\n${r.fallbackOwner && r.fallbackOwner.ownerId ? `\\`${esc(r.fallbackOwner.ownerId)}\\`${r.fallbackOwner.name ? ` ${esc(r.fallbackOwner.name)}` : ''} · _${esc(r.fallbackOwner.source.replace(/_/g, ' '))}_` : '_choose manually_'}` },\n    ],\n  });\n  blocks.push({\n    type: 'section',\n    text: { type: 'mrkdwn', text: `⚙️ *${c.enabledWorkflows}* active workflows · 📨 *${c.sequenceContacts}* contacts in sequences · 💼 *${c.openDeals}* open deals (*${c.dealsAtRisk}* at risk) · 🎫 *${c.openTickets}* open tickets · ✅ *${c.openTasks}* open tasks (*${c.overdueTasks}* overdue)` },\n  });\n  blocks.push({ type: 'divider' });\n  for (const prio of ['P0', 'P1', 'P2']) {\n    const list = (r.checklist || []).filter((x) => x.priority === prio);\n    if (!list.length) continue;\n    const label = prio === 'P0' ? '*P0 · Do today*' : prio === 'P1' ? '*P1 · Within 3 days*' : '*P2 · Within 7 days*';\n    const lines = list.slice(0, 8).map((x) => `• <${x.hubspotLink}|${esc(x.title)}>\\n   ${esc(x.action)}`);\n    if (list.length > 8) lines.push(`• …and ${list.length - 8} more (see Todoist or the audit log)`);\n    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `${label}\\n${lines.join('\\n')}`.slice(0, 2900) } });\n  }\n  if ((r.evidenceErrors || []).length) {\n    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `⚠️ Incomplete scan: ${esc(r.evidenceErrors.map((e) => e.source).join(', '))}. Check these manually.` }] });\n  }\n  blocks.push({ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'Open user management', emoji: true }, url: r.links.users, ...(r.tier === 'critical' ? { style: 'danger' } : {}) }] });\n}\n\nblocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `Run \\`${esc(item.run && item.run.runId)}\\` · ${esc(item.run && item.run.trigger)} · mode ${esc(item.run && item.run.mode)} · n8n-hubspot-user-permission-offboarding-sanitizer` }] });\n\n// ── Todoist plan ──────────────────────────────────────────────────────\nlet todoistPlan = null;\nif (item.kind === 'report') {\n  const p = r.person;\n  const base = { labels: TODOIST_LABELS, ...(TODOIST_PROJECT ? { project_id: TODOIST_PROJECT } : {}), ...(TODOIST_SECTION ? { section_id: TODOIST_SECTION } : {}) };\n  todoistPlan = {\n    parent: {\n      ...base,\n      content: `Offboard HubSpot assets: ${p.name} (${STATUS_LABEL[p.status] || p.status})`.slice(0, 500),\n      description: [\n        `Risk: ${String(r.tier).toUpperCase()} (score ${r.score}) · Owner ID ${p.ownerId} · User ID ${p.userId || 'n/a'}`,\n        `Fallback owner: ${r.fallbackOwner.ownerId || 'choose manually'} (${r.fallbackOwner.source})`,\n        `Counts: ${r.counts.enabledWorkflows} active workflows, ${r.counts.sequenceContacts} contacts in sequences, ${r.counts.openDeals} open deals, ${r.counts.openTickets} open tickets, ${r.counts.openTasks} open tasks`,\n        `Run ${item.run.runId}`,\n      ].join('\\n'),\n      priority: r.groups.P0 > 0 ? 4 : r.groups.P1 > 0 ? 3 : 2,\n      due_string: r.groups.P0 > 0 ? 'today' : 'in 3 days',\n    },\n    subtasks: (r.checklist || []).slice(0, MAX_SUBTASKS).map((x) => ({\n      ...base,\n      content: `[${x.priority}] ${x.title}`.slice(0, 500),\n      description: `${x.action}\\n${x.hubspotLink}${x.sample.length ? `\\n\\nExamples:\\n- ${x.sample.join('\\n- ')}` : ''}`.slice(0, 4000),\n      priority: PRIORITY_TODOIST[x.priority] || 2,\n      due_string: DUE[x.priority] || 'in 7 days',\n    })),\n  };\n}\n\nconst live = !SANDBOX_MODE && !DRY_RUN;\nconst slackDelivery = !CHANNELS.has('slack') ? 'disabled' : !live ? 'dry_run' : env('SLACK_WEBHOOK_URL', '') ? 'live' : 'not_configured';\nconst todoistDelivery = !CHANNELS.has('todoist') || !todoistPlan ? 'disabled' : !live ? 'dry_run' : env('TODOIST_API_TOKEN', '') ? 'live' : 'not_configured';\n\nreturn { json: { ...item, slackDelivery, todoistDelivery, slackMessage: { text, blocks: blocks.slice(0, 50) }, todoistPlan } };\n"
+      },
+      "id": "b3d6a36c-75b5-5e7e-9519-3d7a2f9167c7",
+      "name": "Build Notifications",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5280,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "4c8ad8b1-4408-514e-90b7-ee637eee9b3f",
+              "leftValue": "={{ $json.slackDelivery }}",
+              "rightValue": "live",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "29123887-c3a8-5b9f-bb5f-d12818388dbf",
+      "name": "Post to Slack?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5520,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "c2da610a-e986-59c7-a772-3a4fbafa14a6",
+      "name": "Post Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5760,
+        -80
+      ],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Slack incoming webhook for the RevOps security channel."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Confirm Slack Delivery               Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst ctx = $('Post to Slack?').item.json;\nreturn { json: { ...ctx, todoistPlan: undefined, delivery: { slack: { mode: 'live', ok: true, simulated: false, at: new Date().toISOString() } } } };\n"
+      },
+      "id": "2118abee-0048-5061-9661-92b58c0bc4ac",
+      "name": "Confirm Slack Delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6000,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitize Slack Error                 Mode: Run Once for Each Item\n// Slack rejected the post after retries. Clears the report fingerprint so\n// the next scheduled run notifies again instead of staying quiet.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL', 'TODOIST_API_TOKEN', 'WEBHOOK_SHARED_SECRET']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/\\bxox[abposr]-[A-Za-z0-9-]+/g, '[REDACTED_SLACK_TOKEN]')\n    .replace(/\\b[a-f0-9]{40}\\b/g, '[REDACTED_40_HEX_TOKEN]')\n    .replace(/([?&](?:hapikey|api_key|apikey|token|key|secret)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskEmail = (email) => {\n  const s = String(email || '');\n  const at = s.indexOf('@');\n  return at > 0 ? `${s[0]}***@${s.slice(at + 1).toLowerCase()}` : null;\n};\n\nconst ctx = $('Post to Slack?').item.json;\nconst err = $json.error ?? $json;\nconst message = typeof err === 'string' ? err : (err && (err.message || err.description)) || 'slack_post_failed';\nconst httpCode = (err && (err.httpCode || err.statusCode || err.status)) || null;\n\nlet ledgerReleased = false;\ntry {\n  const store = $getWorkflowStaticData('global').hsOffboardingSanitizer;\n  const key = ctx.kind === 'scan_error' ? '__scan_error__' : ctx.report && ctx.report.person ? ctx.report.person.ownerId : null;\n  if (store && store.reports && key && store.reports[key]) { delete store.reports[key]; ledgerReleased = true; }\n} catch (error) { ledgerReleased = false; }\n\nreturn {\n  json: {\n    ...ctx,\n    todoistPlan: undefined,\n    delivery: { slack: { mode: 'live', ok: false, simulated: false, httpCode: httpCode ? String(httpCode) : null, message: redactString(message).slice(0, 300), ledgerReleased } },\n  },\n};\n"
+      },
+      "id": "720d8829-cdee-5db2-9a34-48aeed4d313b",
+      "name": "Sanitize Slack Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6000,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Notification Dispatch (Dry Run)  Mode: Run Once for Each Item\n// No network call. Records what would be sent on each channel.\n// ─────────────────────────────────────────────────────────────────────\nconst item = $json;\nreturn {\n  json: {\n    ...item,\n    delivery: {\n      slack: { mode: item.slackDelivery, simulated: true, blockCount: item.slackMessage ? item.slackMessage.blocks.length : 0 },\n      todoist: {\n        mode: item.todoistDelivery,\n        simulated: item.todoistDelivery !== 'live',\n        parentTask: item.todoistPlan ? item.todoistPlan.parent.content : null,\n        subtaskCount: item.todoistPlan ? item.todoistPlan.subtasks.length : 0,\n      },\n      note: 'Dry run: payloads built, nothing sent. Paste slackMessage.blocks into Block Kit Builder to preview.',\n    },\n  },\n};\n"
+      },
+      "id": "db689a68-cc39-57aa-bc95-2c25518773a7",
+      "name": "Simulate Notification Dispatch (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5760,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "24029783-629c-5259-8442-7e7a31f9f096",
+              "leftValue": "={{ $json.todoistDelivery }}",
+              "rightValue": "live",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b50a3a54-22bb-558b-9101-753b532289c6",
+      "name": "Create Todoist Tasks?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5520,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.TODOIST_API_BASE_URL || 'https://api.todoist.com/api/v1' }}/tasks",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 15000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.TODOIST_API_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Request-Id",
+              "value": "={{ $json.run.runId }}:{{ $json.report.person.ownerId }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.todoistPlan.parent) }}"
+      },
+      "id": "6bd15e43-c0ac-57a2-8e13-a127d9a99bdb",
+      "name": "Create Todoist Parent Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5760,
+        280
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Todoist API v1 (REST v2 is retired)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Todoist Sub-tasks              Mode: Run Once for All Items\n// Pairs each parent-task response with its report and emits one sub-task\n// request per checklist item, linked with parent_id.\n// ─────────────────────────────────────────────────────────────────────\nconst reports = $('Create Todoist Tasks?').all().map((i) => i.json);\nconst parents = $input.all().map((i) => i.json);\nconst out = [];\nreports.forEach((rep, index) => {\n  const res = parents[index] || {};\n  const ok = Number(res.statusCode) >= 200 && Number(res.statusCode) < 300 && res.body && res.body.id;\n  if (!ok || !rep.todoistPlan) return;\n  rep.todoistPlan.subtasks.forEach((sub, n) => {\n    out.push({ json: { reportIndex: index, subtaskIndex: n, requestId: `${rep.run.runId}:${rep.report.person.ownerId}:${n}`, body: { ...sub, parent_id: String(res.body.id) } } });\n  });\n});\nreturn out.length ? out : [{ json: { noSubtasks: true } }];\n"
+      },
+      "id": "259dac15-3860-51be-a28a-3a486f9e2cb4",
+      "name": "Build Todoist Sub-tasks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6000,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cfed8089-56b7-5a2a-bb28-43410fc1f2f0",
+              "leftValue": "={{ $json.noSubtasks !== true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "129e59e9-435e-5379-9b79-688b35195564",
+      "name": "Has Sub-tasks?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6240,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.TODOIST_API_BASE_URL || 'https://api.todoist.com/api/v1' }}/tasks",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 15000,
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          }
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.TODOIST_API_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-Request-Id",
+              "value": "={{ $json.requestId }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}"
+      },
+      "id": "ebc4a314-8cd1-5883-978f-8af276938402",
+      "name": "Create Todoist Sub-tasks",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6480,
+        220
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Summarize Todoist Delivery           Mode: Run Once for All Items\n// One delivery record per report: parent task ID, sub-tasks created/failed.\n// Task IDs are kept; task contents are not repeated in the audit log.\n// ─────────────────────────────────────────────────────────────────────\nconst reports = $('Create Todoist Tasks?').all().map((i) => i.json);\nconst parents = $('Create Todoist Parent Task').all().map((i) => i.json);\nconst subJobs = $('Build Todoist Sub-tasks').all().map((i) => i.json);\nlet subRes = [];\ntry { subRes = $('Create Todoist Sub-tasks').all().map((i) => i.json); } catch (error) { subRes = []; }\n\nreturn reports.map((rep, index) => {\n  const parent = parents[index] || {};\n  const parentOk = Number(parent.statusCode) >= 200 && Number(parent.statusCode) < 300 && parent.body && parent.body.id;\n  let created = 0;\n  let failed = 0;\n  subJobs.forEach((job, i) => {\n    if (job.noSubtasks || job.reportIndex !== index) return;\n    const r = subRes[i] || {};\n    if (Number(r.statusCode) >= 200 && Number(r.statusCode) < 300) created++;\n    else failed++;\n  });\n  return {\n    json: {\n      ...rep,\n      todoistPlan: undefined,\n      delivery: {\n        todoist: {\n          mode: 'live',\n          simulated: false,\n          ok: !!parentOk && failed === 0,\n          parentTaskId: parentOk ? String(parent.body.id) : null,\n          parentStatus: Number(parent.statusCode) || null,\n          subtasksCreated: created,\n          subtasksFailed: failed,\n          hint: !parentOk && Number(parent.statusCode) === 401 ? 'check TODOIST_API_TOKEN' : !parentOk && Number(parent.statusCode) === 410 ? 'endpoint retired: confirm the current Todoist API version' : null,\n        },\n      },\n    },\n  };\n});\n"
+      },
+      "id": "24623899-c124-58b2-84b4-153c03c923e4",
+      "name": "Summarize Todoist Delivery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6720,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Audit Logger                         Mode: Run Once for Each Item\n// One redacted audit record per report, rejection or delivery. Counts and\n// IDs only: record names, deal names and contact data are not logged.\n// Written to stdout and to a static-data ring buffer (not in sandbox).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL', 'TODOIST_API_TOKEN', 'WEBHOOK_SHARED_SECRET']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/\\bxox[abposr]-[A-Za-z0-9-]+/g, '[REDACTED_SLACK_TOKEN]')\n    .replace(/\\b[a-f0-9]{40}\\b/g, '[REDACTED_40_HEX_TOKEN]')\n    .replace(/([?&](?:hapikey|api_key|apikey|token|key|secret)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskEmail = (email) => {\n  const s = String(email || '');\n  const at = s.indexOf('@');\n  return at > 0 ? `${s[0]}***@${s.slice(at + 1).toLowerCase()}` : null;\n};\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst RING_SIZE = Math.max(0, num('AUDIT_RING_BUFFER_SIZE', 300));\nconst LOG_TO_STDOUT = flag('AUDIT_LOG_TO_STDOUT', true);\n\nconst item = $json;\nconst r = item.report || {};\nconst person = r.person || null;\nconst record = redact({\n  auditVersion: 1,\n  at: new Date().toISOString(),\n  workflowId: $workflow.id || null,\n  executionId: $execution.id || null,\n  runId: item.run ? item.run.runId : null,\n  trigger: item.run ? item.run.trigger : null,\n  mode: item.run ? item.run.mode : null,\n  kind: item.kind || null,\n  route: item.route || (item.kind === 'rejected' ? 'rejected' : null),\n  rejectReason: item.run && item.kind === 'rejected' ? item.run.rejectReason : null,\n  subject: person ? { ownerId: person.ownerId, userId: person.userId, emailMasked: person.emailMasked, status: person.status, signals: person.signals, requested: person.requested } : null,\n  risk: r.tier ? { tier: r.tier, score: r.score ?? null } : null,\n  counts: r.counts || null,\n  checklist: r.checklist ? { total: r.checklist.length, P0: r.groups.P0, P1: r.groups.P1, P2: r.groups.P2, assetTypes: [...new Set(r.checklist.map((c) => c.assetType))] } : null,\n  fallbackOwner: r.fallbackOwner ? { ownerId: r.fallbackOwner.ownerId, source: r.fallbackOwner.source, warning: r.fallbackOwner.warning || null } : null,\n  evidenceErrors: r.evidenceErrors ? r.evidenceErrors.map((e) => ({ source: e.source, statusCode: e.statusCode })) : null,\n  suppression: item.suppression || null,\n  error: r.error || null,\n  directorySummary: r.directorySummary || null,\n  delivery: item.delivery || null,\n});\n\nif (LOG_TO_STDOUT) {\n  try { console.log(`[hs-offboarding] ${JSON.stringify(record)}`); } catch (error) { /* best effort */ }\n}\nif (RING_SIZE > 0 && !SANDBOX_MODE) {\n  try {\n    const store = $getWorkflowStaticData('global');\n    if (!Array.isArray(store.hsOffboardingAudit)) store.hsOffboardingAudit = [];\n    store.hsOffboardingAudit.push(record);\n    if (store.hsOffboardingAudit.length > RING_SIZE) store.hsOffboardingAudit.splice(0, store.hsOffboardingAudit.length - RING_SIZE);\n  } catch (error) { /* static data unavailable in some manual runs */ }\n}\n\nreturn { json: record };\n"
+      },
+      "id": "744f2737-93c7-5764-802f-a03f210cbbda",
+      "name": "Audit Logger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6960,
+        240
+      ],
+      "notes": "Counts and IDs only. stdout + ring buffer."
+    },
+    {
+      "parameters": {},
+      "id": "9150613c-d83c-53ad-a856-465d51a53cee",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        760
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces and request options, redacts secrets, and emits a\n// safe alert record (and optionally a minimal Slack notice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL', 'TODOIST_API_TOKEN', 'WEBHOOK_SHARED_SECRET']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/\\bxox[abposr]-[A-Za-z0-9-]+/g, '[REDACTED_SLACK_TOKEN]')\n    .replace(/\\b[a-f0-9]{40}\\b/g, '[REDACTED_40_HEX_TOKEN]')\n    .replace(/([?&](?:hapikey|api_key|apikey|token|key|secret)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\nconst maskEmail = (email) => {\n  const s = String(email || '');\n  const at = s.indexOf('@');\n  return at > 0 ? `${s[0]}***@${s.slice(at + 1).toLowerCase()}` : null;\n};\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || (json.trigger && json.trigger.error) || {};\n  const alert = {\n    alertType: 'hs_offboarding_sanitizer_execution_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow ? json.workflow.id : null, name: redactString(json.workflow ? json.workflow.name : '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error').slice(0, 300),\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[hs-offboarding:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  const notify = !SANDBOX_MODE && !DRY_RUN && env('SLACK_WEBHOOK_URL', '') !== '' && flag('SLACK_NOTIFY_ON_MONITOR_ERROR', true);\n  return {\n    json: {\n      ...alert,\n      notify,\n      slackMessage: {\n        text: `Offboarding sanitizer execution failed at ${alert.lastNodeExecuted || 'unknown node'}`,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: '⚠️ Offboarding sanitizer execution failed', emoji: true } },\n          { type: 'section', text: { type: 'mrkdwn', text: `*Node:* ${alert.lastNodeExecuted || 'unknown'}\\n*Error:* ${alert.errorName}: ${alert.errorMessage}` } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: `Execution \\`${alert.execution.id || 'n/a'}\\` · offboarding audits are paused until this is fixed` }] },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "2decd1a4-6804-5537-8f16-ed3aa3852c04",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b47e500b-1bf1-5ee5-815a-2e48f1d82d5f",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e228e79a-b87e-54d1-bb0e-f204820c132b",
+      "name": "Notify Execution Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "fe809342-a4a7-59b7-beb0-b80fff7446e0",
+      "name": "Post Execution Error Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        700
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## n8n-hubspot-user-permission-offboarding-sanitizer\nRead-only offboarding audit for HubSpot. dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. No HubSpot calls, no Slack posts, no Todoist tasks until both are `false`.\n\n**Stage 1** Execute the *Daily Offboarding Scan* trigger (pinned fictional fixtures).\n**Stage 2** `SANDBOX_MODE=false`: real reads in a test portal, notifications simulated.\n**Stage 3** `DRY_RUN=false`: Slack + Todoist go live.\n\nThe workflow never reassigns records itself. See README.md.",
+        "height": 320,
+        "width": 660,
+        "color": 4
+      },
+      "id": "a8ae6025-03e0-5a5e-9bfe-a32b89d0e932",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Live evidence chain\nUsers API + Owners API (active and archived) → CRM searches → owned sequences → workflow definitions. Every call is a read with the response kept as data (never error), so one failing source becomes a *scan gap* in the checklist.",
+        "height": 150,
+        "width": 520,
+        "color": 3
+      },
+      "id": "64067ab9-3fc9-50d4-815e-8a32bac8e7fe",
+      "name": "Sticky: Evidence",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2600,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Sanitized error path\nNo stack traces, headers or request options. Tokens, webhook URLs and emails are redacted.",
+        "height": 90,
+        "width": 560,
+        "color": 2
+      },
+      "id": "96a7c2f2-0092-5c38-a92b-aa2f854e85ba",
+      "name": "Sticky: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        640
+      ]
+    }
+  ],
+  "connections": {
+    "Daily Offboarding Scan": {
+      "main": [
+        [
+          {
+            "node": "Build Run Context & Authenticate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Offboarding Request Webhook": {
+      "main": [
+        [
+          {
+            "node": "Build Run Context & Authenticate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Run Context & Authenticate": {
+      "main": [
+        [
+          {
+            "node": "Request Accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request Accepted?": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Mode?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Mode?": {
+      "main": [
+        [
+          {
+            "node": "Load Sandbox Directory",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "List HubSpot Users",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Sandbox Directory": {
+      "main": [
+        [
+          {
+            "node": "Identify Departing Users",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List HubSpot Users": {
+      "main": [
+        [
+          {
+            "node": "List Archived Owners",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Archived Owners": {
+      "main": [
+        [
+          {
+            "node": "List Active Owners",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Active Owners": {
+      "main": [
+        [
+          {
+            "node": "Collect Directory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Directory": {
+      "main": [
+        [
+          {
+            "node": "Identify Departing Users",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Identify Departing Users": {
+      "main": [
+        [
+          {
+            "node": "Departing Users Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Departing Users Found?": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Evidence?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reassignment Checklist Generator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Evidence?": {
+      "main": [
+        [
+          {
+            "node": "Load Sandbox Evidence",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build CRM Search Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Sandbox Evidence": {
+      "main": [
+        [
+          {
+            "node": "Orphaned Asset & Data Scanner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build CRM Search Jobs": {
+      "main": [
+        [
+          {
+            "node": "Run CRM Orphan Searches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run CRM Orphan Searches": {
+      "main": [
+        [
+          {
+            "node": "Build Sequence Lookups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Sequence Lookups": {
+      "main": [
+        [
+          {
+            "node": "Fetch Owned Sequences",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Owned Sequences": {
+      "main": [
+        [
+          {
+            "node": "List Workflows (v4)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List Workflows (v4)": {
+      "main": [
+        [
+          {
+            "node": "Build Workflow Scan Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Workflow Scan Jobs": {
+      "main": [
+        [
+          {
+            "node": "Fetch Workflow Definitions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Workflow Definitions": {
+      "main": [
+        [
+          {
+            "node": "Collect Evidence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Evidence": {
+      "main": [
+        [
+          {
+            "node": "Orphaned Asset & Data Scanner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Orphaned Asset & Data Scanner": {
+      "main": [
+        [
+          {
+            "node": "Reassignment Checklist Generator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reassignment Checklist Generator": {
+      "main": [
+        [
+          {
+            "node": "Notify?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify?": {
+      "main": [
+        [
+          {
+            "node": "Build Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Notifications": {
+      "main": [
+        [
+          {
+            "node": "Post to Slack?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Create Todoist Tasks?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post to Slack?": {
+      "main": [
+        [
+          {
+            "node": "Post Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Notification Dispatch (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Confirm Slack Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanitize Slack Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Slack Delivery": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitize Slack Error": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Notification Dispatch (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Todoist Tasks?": {
+      "main": [
+        [
+          {
+            "node": "Create Todoist Parent Task",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Create Todoist Parent Task": {
+      "main": [
+        [
+          {
+            "node": "Build Todoist Sub-tasks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Todoist Sub-tasks": {
+      "main": [
+        [
+          {
+            "node": "Has Sub-tasks?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Sub-tasks?": {
+      "main": [
+        [
+          {
+            "node": "Create Todoist Sub-tasks",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Summarize Todoist Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Todoist Sub-tasks": {
+      "main": [
+        [
+          {
+            "node": "Summarize Todoist Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize Todoist Delivery": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Notify Execution Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Execution Error?": {
+      "main": [
+        [
+          {
+            "node": "Post Execution Error Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "Daily Offboarding Scan": [
+      {
+        "json": {
+          "timestamp": "2026-11-16T06:30:00.000+06:00",
+          "Readable date": "November 16th 2026, 6:30:00 am",
+          "Timezone": "Asia/Dhaka (UTC+06:00)",
+          "sandboxFixtures": {
+            "fixtureSet": "fictional-offboarding-v1",
+            "note": "All people, emails, IDs, deals and workflows are fictional. Workflow action schemas are simplified.",
+            "directory": {
+              "users": [
+                {
+                  "id": "81000001",
+                  "email": "avery.quinn@fictional-co.example",
+                  "roleIds": [
+                    "9001"
+                  ],
+                  "primaryTeamId": null,
+                  "superAdmin": true
+                },
+                {
+                  "id": "81000002",
+                  "email": "morgan.ellis@fictional-co.example",
+                  "roleIds": [
+                    "9002"
+                  ],
+                  "primaryTeamId": "5100001",
+                  "superAdmin": false
+                },
+                {
+                  "id": "81000003",
+                  "email": "priya.nandakumar@fictional-co.example",
+                  "roleIds": [
+                    "9002"
+                  ],
+                  "primaryTeamId": "5100001",
+                  "superAdmin": false
+                },
+                {
+                  "id": "81000004",
+                  "email": "sam.okoro@fictional-co.example",
+                  "roleIds": [
+                    "9003"
+                  ],
+                  "primaryTeamId": "5100002",
+                  "superAdmin": false
+                },
+                {
+                  "id": "81000005",
+                  "email": "riley.chen@fictional-co.example",
+                  "roleIds": [],
+                  "primaryTeamId": null,
+                  "superAdmin": false
+                },
+                {
+                  "id": "81000006",
+                  "email": "taylor.brooks@fictional-co.example",
+                  "roleIds": [
+                    "9002"
+                  ],
+                  "primaryTeamId": "5100001",
+                  "superAdmin": false
+                }
+              ],
+              "activeOwners": [
+                {
+                  "id": "61000001",
+                  "email": "avery.quinn@fictional-co.example",
+                  "type": "PERSON",
+                  "firstName": "Avery",
+                  "lastName": "Quinn",
+                  "userId": 81000001,
+                  "userIdIncludingInactive": 81000001,
+                  "createdAt": "2024-02-01T09:00:00.000Z",
+                  "updatedAt": "SANDBOX_DAYS_AGO:400",
+                  "archived": false
+                },
+                {
+                  "id": "61000002",
+                  "email": "morgan.ellis@fictional-co.example",
+                  "type": "PERSON",
+                  "firstName": "Morgan",
+                  "lastName": "Ellis",
+                  "userId": 81000002,
+                  "userIdIncludingInactive": 81000002,
+                  "createdAt": "2024-02-01T09:00:00.000Z",
+                  "updatedAt": "SANDBOX_DAYS_AGO:400",
+                  "archived": false,
+                  "teams": [
+                    {
+                      "id": "5100001",
+                      "name": "Sales East",
+                      "primary": true
+                    }
+                  ]
+                },
+                {
+                  "id": "61000003",
+                  "email": "priya.nandakumar@fictional-co.example",
+                  "type": "PERSON",
+                  "firstName": "Priya",
+                  "lastName": "Nandakumar",
+                  "userId": 81000003,
+                  "userIdIncludingInactive": 81000003,
+                  "createdAt": "2024-02-01T09:00:00.000Z",
+                  "updatedAt": "SANDBOX_DAYS_AGO:400",
+                  "archived": false,
+                  "teams": [
+                    {
+                      "id": "5100001",
+                      "name": "Sales East",
+                      "primary": true
+                    }
+                  ]
+                },
+                {
+                  "id": "61000004",
+                  "email": "sam.okoro@fictional-co.example",
+                  "type": "PERSON",
+                  "firstName": "Sam",
+                  "lastName": "Okoro",
+                  "userId": 81000004,
+                  "userIdIncludingInactive": 81000004,
+                  "createdAt": "2024-02-01T09:00:00.000Z",
+                  "updatedAt": "SANDBOX_DAYS_AGO:400",
+                  "archived": false,
+                  "teams": [
+                    {
+                      "id": "5100002",
+                      "name": "Customer Success",
+                      "primary": true
+                    }
+                  ]
+                },
+                {
+                  "id": "61000005",
+                  "email": "riley.chen@fictional-co.example",
+                  "type": "PERSON",
+                  "firstName": "Riley",
+                  "lastName": "Chen",
+                  "userId": 81000005,
+                  "userIdIncludingInactive": 81000005,
+                  "createdAt": "2024-02-01T09:00:00.000Z",
+                  "updatedAt": "SANDBOX_DAYS_AGO:400",
+                  "archived": false
+                },
+                {
+                  "id": "61000006",
+                  "email": "taylor.brooks@fictional-co.example",
+                  "type": "PERSON",
+                  "firstName": "Taylor",
+                  "lastName": "Brooks",
+                  "userId": 81000006,
+                  "userIdIncludingInactive": 81000006,
+                  "createdAt": "2024-02-01T09:00:00.000Z",
+                  "updatedAt": "SANDBOX_DAYS_AGO:400",
+                  "archived": false,
+                  "teams": [
+                    {
+                      "id": "5100001",
+                      "name": "Sales East",
+                      "primary": true
+                    }
+                  ]
+                },
+                {
+                  "id": "61000007",
+                  "email": "casey.lin@fictional-co.example",
+                  "type": "PERSON",
+                  "firstName": "Casey",
+                  "lastName": "Lin",
+                  "userId": 81000007,
+                  "userIdIncludingInactive": 81000007,
+                  "createdAt": "2024-02-01T09:00:00.000Z",
+                  "updatedAt": "SANDBOX_DAYS_AGO:400",
+                  "archived": false,
+                  "teams": [
+                    {
+                      "id": "5100003",
+                      "name": "Sales West",
+                      "primary": true
+                    }
+                  ]
+                }
+              ],
+              "archivedOwners": [
+                {
+                  "id": "61000010",
+                  "email": "jordan.vale@fictional-co.example",
+                  "type": "PERSON",
+                  "firstName": "Jordan",
+                  "lastName": "Vale",
+                  "userId": null,
+                  "userIdIncludingInactive": 81000010,
+                  "createdAt": "2024-02-01T09:00:00.000Z",
+                  "updatedAt": "SANDBOX_DAYS_AGO:5",
+                  "archived": true,
+                  "teams": [
+                    {
+                      "id": "5100001",
+                      "name": "Sales East",
+                      "primary": true
+                    }
+                  ]
+                },
+                {
+                  "id": "61000011",
+                  "email": "dana.whitfield@fictional-co.example",
+                  "type": "PERSON",
+                  "firstName": "Dana",
+                  "lastName": "Whitfield",
+                  "userId": null,
+                  "userIdIncludingInactive": 81000011,
+                  "createdAt": "2024-02-01T09:00:00.000Z",
+                  "updatedAt": "SANDBOX_DAYS_AGO:9",
+                  "archived": true,
+                  "teams": [
+                    {
+                      "id": "5100002",
+                      "name": "Customer Success",
+                      "primary": true
+                    }
+                  ]
+                },
+                {
+                  "id": "61000012",
+                  "email": "lee.harper@fictional-co.example",
+                  "type": "PERSON",
+                  "firstName": "Lee",
+                  "lastName": "Harper",
+                  "userId": null,
+                  "userIdIncludingInactive": 81000012,
+                  "createdAt": "2024-02-01T09:00:00.000Z",
+                  "updatedAt": "SANDBOX_DAYS_AGO:200",
+                  "archived": true,
+                  "teams": [
+                    {
+                      "id": "5100003",
+                      "name": "Sales West",
+                      "primary": true
+                    }
+                  ]
+                }
+              ]
+            },
+            "evidence": {
+              "61000010": {
+                "deals": {
+                  "ok": true,
+                  "total": 7,
+                  "sample": [
+                    {
+                      "id": "920000001",
+                      "name": "Fixture Co · Platform Renewal",
+                      "amount": 64000,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:12",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    },
+                    {
+                      "id": "920000002",
+                      "name": "Sample Labs · Expansion",
+                      "amount": 18000,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:20",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    },
+                    {
+                      "id": "920000003",
+                      "name": "Demo Freight · New Logo",
+                      "amount": 9500,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:45",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    },
+                    {
+                      "id": "920000004",
+                      "name": "Placeholder Health · Pilot",
+                      "amount": 12000,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:60",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    },
+                    {
+                      "id": "920000005",
+                      "name": "Example Retail · Upsell",
+                      "amount": 7000,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:75",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    },
+                    {
+                      "id": "920000006",
+                      "name": "Test Robotics · Services",
+                      "amount": 4200,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:90",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    },
+                    {
+                      "id": "920000007",
+                      "name": "Mock Energy · Add-on seats",
+                      "amount": 3100,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:120",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    }
+                  ]
+                },
+                "tasks": {
+                  "ok": true,
+                  "total": 12,
+                  "sample": [
+                    {
+                      "id": "930000001",
+                      "subject": "Follow-up call #1",
+                      "dueAt": "SANDBOX_DAYS_AGO:1",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000002",
+                      "subject": "Follow-up call #2",
+                      "dueAt": "SANDBOX_DAYS_AGO:2",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000003",
+                      "subject": "Follow-up call #3",
+                      "dueAt": "SANDBOX_DAYS_AGO:3",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000004",
+                      "subject": "Follow-up call #4",
+                      "dueAt": "SANDBOX_DAYS_AGO:4",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000005",
+                      "subject": "Follow-up call #5",
+                      "dueAt": "SANDBOX_DAYS_AGO:5",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000006",
+                      "subject": "Follow-up call #6",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:6",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000007",
+                      "subject": "Follow-up call #7",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:7",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000008",
+                      "subject": "Follow-up call #8",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:8",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000009",
+                      "subject": "Follow-up call #9",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:9",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000010",
+                      "subject": "Follow-up call #10",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:10",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000011",
+                      "subject": "Follow-up call #11",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:11",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000012",
+                      "subject": "Follow-up call #12",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:12",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    }
+                  ]
+                },
+                "tickets": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                },
+                "sequenceContacts": {
+                  "ok": true,
+                  "total": 34,
+                  "sample": [
+                    {
+                      "id": "950000001"
+                    },
+                    {
+                      "id": "950000002"
+                    },
+                    {
+                      "id": "950000003"
+                    },
+                    {
+                      "id": "950000004"
+                    },
+                    {
+                      "id": "950000005"
+                    },
+                    {
+                      "id": "950000006"
+                    },
+                    {
+                      "id": "950000007"
+                    },
+                    {
+                      "id": "950000008"
+                    },
+                    {
+                      "id": "950000009"
+                    },
+                    {
+                      "id": "950000010"
+                    },
+                    {
+                      "id": "950000011"
+                    },
+                    {
+                      "id": "950000012"
+                    },
+                    {
+                      "id": "950000013"
+                    },
+                    {
+                      "id": "950000014"
+                    },
+                    {
+                      "id": "950000015"
+                    },
+                    {
+                      "id": "950000016"
+                    },
+                    {
+                      "id": "950000017"
+                    },
+                    {
+                      "id": "950000018"
+                    },
+                    {
+                      "id": "950000019"
+                    },
+                    {
+                      "id": "950000020"
+                    },
+                    {
+                      "id": "950000021"
+                    },
+                    {
+                      "id": "950000022"
+                    },
+                    {
+                      "id": "950000023"
+                    },
+                    {
+                      "id": "950000024"
+                    },
+                    {
+                      "id": "950000025"
+                    }
+                  ]
+                },
+                "ownedSequences": {
+                  "ok": true,
+                  "total": 3,
+                  "sample": [
+                    {
+                      "id": "9600001",
+                      "name": "Outbound · Q4 Enterprise"
+                    },
+                    {
+                      "id": "9600002",
+                      "name": "Event follow-up · Fixture Summit"
+                    },
+                    {
+                      "id": "9600003",
+                      "name": "Re-engage · Closed lost"
+                    }
+                  ]
+                }
+              },
+              "61000011": {
+                "deals": {
+                  "ok": true,
+                  "total": 1,
+                  "sample": [
+                    {
+                      "id": "920000001",
+                      "name": "Sample Labs · Support plan",
+                      "amount": 6000,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:70",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    }
+                  ]
+                },
+                "tasks": {
+                  "ok": true,
+                  "total": 4,
+                  "sample": [
+                    {
+                      "id": "930000001",
+                      "subject": "Follow-up call #1",
+                      "dueAt": "SANDBOX_DAYS_AGO:1",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000002",
+                      "subject": "Follow-up call #2",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:2",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000003",
+                      "subject": "Follow-up call #3",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:3",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000004",
+                      "subject": "Follow-up call #4",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:4",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    }
+                  ]
+                },
+                "tickets": {
+                  "ok": true,
+                  "total": 9,
+                  "sample": [
+                    {
+                      "id": "940000001",
+                      "subject": "Customer issue #1",
+                      "priority": "HIGH",
+                      "stage": "2",
+                      "createdAt": "SANDBOX_DAYS_AGO:2"
+                    },
+                    {
+                      "id": "940000002",
+                      "subject": "Customer issue #2",
+                      "priority": "HIGH",
+                      "stage": "2",
+                      "createdAt": "SANDBOX_DAYS_AGO:4"
+                    },
+                    {
+                      "id": "940000003",
+                      "subject": "Customer issue #3",
+                      "priority": "MEDIUM",
+                      "stage": "2",
+                      "createdAt": "SANDBOX_DAYS_AGO:6"
+                    },
+                    {
+                      "id": "940000004",
+                      "subject": "Customer issue #4",
+                      "priority": "MEDIUM",
+                      "stage": "2",
+                      "createdAt": "SANDBOX_DAYS_AGO:8"
+                    },
+                    {
+                      "id": "940000005",
+                      "subject": "Customer issue #5",
+                      "priority": "MEDIUM",
+                      "stage": "2",
+                      "createdAt": "SANDBOX_DAYS_AGO:10"
+                    },
+                    {
+                      "id": "940000006",
+                      "subject": "Customer issue #6",
+                      "priority": "MEDIUM",
+                      "stage": "2",
+                      "createdAt": "SANDBOX_DAYS_AGO:12"
+                    },
+                    {
+                      "id": "940000007",
+                      "subject": "Customer issue #7",
+                      "priority": "MEDIUM",
+                      "stage": "2",
+                      "createdAt": "SANDBOX_DAYS_AGO:14"
+                    },
+                    {
+                      "id": "940000008",
+                      "subject": "Customer issue #8",
+                      "priority": "MEDIUM",
+                      "stage": "2",
+                      "createdAt": "SANDBOX_DAYS_AGO:16"
+                    },
+                    {
+                      "id": "940000009",
+                      "subject": "Customer issue #9",
+                      "priority": "MEDIUM",
+                      "stage": "2",
+                      "createdAt": "SANDBOX_DAYS_AGO:18"
+                    }
+                  ]
+                },
+                "sequenceContacts": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                },
+                "ownedSequences": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                }
+              },
+              "61000006": {
+                "deals": {
+                  "ok": true,
+                  "total": 3,
+                  "sample": [
+                    {
+                      "id": "920000001",
+                      "name": "Fixture Bank · Enterprise",
+                      "amount": 85000,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:40",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    },
+                    {
+                      "id": "920000002",
+                      "name": "Demo Media · Starter",
+                      "amount": 5000,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:55",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    },
+                    {
+                      "id": "920000003",
+                      "name": "Example Travel · Pilot",
+                      "amount": 8000,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:80",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    }
+                  ]
+                },
+                "tasks": {
+                  "ok": true,
+                  "total": 2,
+                  "sample": [
+                    {
+                      "id": "930000001",
+                      "subject": "Follow-up call #1",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:1",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    },
+                    {
+                      "id": "930000002",
+                      "subject": "Follow-up call #2",
+                      "dueAt": "SANDBOX_DAYS_FROM_NOW:2",
+                      "status": "NOT_STARTED",
+                      "priority": "MEDIUM"
+                    }
+                  ]
+                },
+                "tickets": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                },
+                "sequenceContacts": {
+                  "ok": true,
+                  "total": 6,
+                  "sample": [
+                    {
+                      "id": "950000001"
+                    },
+                    {
+                      "id": "950000002"
+                    },
+                    {
+                      "id": "950000003"
+                    },
+                    {
+                      "id": "950000004"
+                    },
+                    {
+                      "id": "950000005"
+                    },
+                    {
+                      "id": "950000006"
+                    }
+                  ]
+                },
+                "ownedSequences": {
+                  "ok": true,
+                  "total": 1,
+                  "sample": [
+                    {
+                      "id": "9600001",
+                      "name": "Inbound · Demo request"
+                    }
+                  ]
+                }
+              },
+              "61000007": {
+                "deals": {
+                  "ok": true,
+                  "total": 2,
+                  "sample": [
+                    {
+                      "id": "920000001",
+                      "name": "West Fixture · Renewal",
+                      "amount": 15000,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:95",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    },
+                    {
+                      "id": "920000002",
+                      "name": "Sample Coast · New Logo",
+                      "amount": 11000,
+                      "closeDate": "SANDBOX_DAYS_FROM_NOW:110",
+                      "stage": "contractsent",
+                      "pipeline": "default"
+                    }
+                  ]
+                },
+                "tasks": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                },
+                "tickets": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                },
+                "sequenceContacts": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                },
+                "ownedSequences": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                }
+              },
+              "61000005": {
+                "deals": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                },
+                "tasks": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                },
+                "tickets": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                },
+                "sequenceContacts": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                },
+                "ownedSequences": {
+                  "ok": true,
+                  "total": 0,
+                  "sample": []
+                }
+              },
+              "__workflowDefinitions": [
+                {
+                  "id": "7100001",
+                  "name": "Lead Rotation · Sales East",
+                  "isEnabled": true,
+                  "objectTypeId": "0-1",
+                  "type": "CONTACT_FLOW",
+                  "actions": [
+                    {
+                      "actionId": "1",
+                      "actionTypeId": "FIXTURE_ROTATE_RECORD_OWNER",
+                      "fields": {
+                        "target_property": "hubspot_owner_id",
+                        "rotation_user_ids": [
+                          "81000010",
+                          "81000003"
+                        ]
+                      }
+                    }
+                  ]
+                },
+                {
+                  "id": "7100002",
+                  "name": "Deal Won · Notify Account Team",
+                  "isEnabled": true,
+                  "objectTypeId": "0-3",
+                  "type": "PLATFORM_FLOW",
+                  "actions": [
+                    {
+                      "actionId": "1",
+                      "actionTypeId": "FIXTURE_SEND_INTERNAL_NOTIFICATION",
+                      "fields": {
+                        "recipient_user_ids": [
+                          "81000010",
+                          "81000002"
+                        ],
+                        "subject": "Deal won"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "id": "7100003",
+                  "name": "Webinar Follow-up · Archive",
+                  "isEnabled": false,
+                  "objectTypeId": "0-1",
+                  "type": "CONTACT_FLOW",
+                  "actions": [
+                    {
+                      "actionId": "1",
+                      "actionTypeId": "FIXTURE_CREATE_TASK",
+                      "fields": {
+                        "task_assignee_owner_id": "61000010",
+                        "subject": "Call attendee"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "id": "7100004",
+                  "name": "Ticket Escalation · Tier 2",
+                  "isEnabled": true,
+                  "objectTypeId": "0-5",
+                  "type": "PLATFORM_FLOW",
+                  "enrollmentCriteria": {
+                    "listFilterBranch": {
+                      "filters": [
+                        {
+                          "property": "hubspot_owner_id",
+                          "operation": {
+                            "operator": "IS_ANY_OF",
+                            "values": [
+                              "61000011"
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  "actions": [
+                    {
+                      "actionId": "1",
+                      "actionTypeId": "FIXTURE_CREATE_TASK",
+                      "fields": {
+                        "task_assignee_owner_id": "61000011",
+                        "subject": "Escalate ticket"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "id": "7100005",
+                  "name": "Enterprise Deal Alert",
+                  "isEnabled": true,
+                  "objectTypeId": "0-3",
+                  "type": "PLATFORM_FLOW",
+                  "actions": [
+                    {
+                      "actionId": "1",
+                      "actionTypeId": "FIXTURE_SEND_EMAIL_NOTIFICATION",
+                      "fields": {
+                        "to_email": "taylor.brooks@fictional-co.example",
+                        "subject": "New enterprise deal"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "id": "7100006",
+                  "name": "Lifecycle · MQL to SQL",
+                  "isEnabled": true,
+                  "objectTypeId": "0-1",
+                  "type": "CONTACT_FLOW",
+                  "actions": [
+                    {
+                      "actionId": "1",
+                      "actionTypeId": "FIXTURE_SET_PROPERTY",
+                      "fields": {
+                        "property": "lifecyclestage",
+                        "value": "salesqualifiedlead"
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            "priorReports": [
+              {
+                "ownerId": "61000011",
+                "fingerprint": "deals:1|tasks:4|tickets:9|seqContacts:0|sequences:0|workflows:1",
+                "hoursAgo": 20
+              }
+            ],
+            "offboardingRequest": {
+              "requestId": "FIXTURE-REQ-0001",
+              "effectiveDate": "SANDBOX_DAYS_FROM_NOW:3",
+              "requestedBy": "hris-fixture",
+              "users": [
+                {
+                  "email": "taylor.brooks@fictional-co.example"
+                }
+              ]
+            }
+          }
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin (dhRobin Systems)",
+    "license": "MIT"
+  }
+}
